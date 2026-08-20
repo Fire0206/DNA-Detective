@@ -383,6 +383,18 @@ class DeterministicPolicy:
                 done: set[tuple[str, str]]) -> Action:
         ranked = sorted(assessments, key=lambda a: a.sort_key)
 
+        # 0. Clinical evidence is the strongest signal (weight 3). A candidate
+        #    at the ranking boundary with no clinical interpretation should be
+        #    investigated first — ClinVar can move it more than any other tool.
+        if "clinvar" in TOOLS:
+            for a in ranked[:3]:
+                if (any("no clinical interpretation" in g for g in a.gaps)
+                        and (a.candidate_id, "clinvar") not in done):
+                    return Action(
+                        "investigate", a.candidate_id, "clinvar",
+                        f"{a.gene} has no clinical interpretation — ClinVar is "
+                        f"the strongest evidence family (weight {W_CLINICAL_MULTI}).")
+
         # 1. The decision that matters is the boundary between rank 1 and rank 2.
         #    Resolve gaps there before anything else.
         for a in ranked[:2]:

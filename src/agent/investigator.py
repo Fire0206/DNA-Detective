@@ -56,7 +56,16 @@ def reason_over_evidence(candidates: list[Candidate], evidence: list[Evidence]) 
     return ranked
 
 
-def follow_up_examples(candidates: list[Candidate], evidence: list[Evidence], policy: str = "template", backend: str = "groq", model: str = "") -> list[dict[str, str]]:
+def follow_up_examples(
+    candidates: list[Candidate],
+    evidence: list[Evidence],
+    policy: str = "template",
+    backend: str = "groq",
+    model: str = "",
+    *,
+    cands: dict | None = None,
+    tools: dict | None = None,
+) -> list[dict[str, str]]:
     """Answer the brief's follow-up questions from the stored evidence only.
 
     Retrieval and comparison are deterministic. When `policy` is "llm" a model
@@ -64,7 +73,20 @@ def follow_up_examples(candidates: list[Candidate], evidence: list[Evidence], po
     evidence ID it emits is checked against the log before the answer is kept -
     a citation that looks real and is not would be the most damaging thing this
     system could output.
+
+    When ``cands`` and ``tools`` are provided, Q&A enters investigation mode:
+    gaps are filled with live tool calls before answering, and ad-hoc variants
+    can be assessed on demand.
     """
     rows = bridge.evidence_as_dicts(evidence)
     ordered = sorted([_assess(bridge.to_engine_dict(c), rows) for c in candidates], key=lambda a: a.sort_key)
-    return [{"user": question, "agent": _qa_answer(question, ordered, rows, policy, backend, model)} for question in _FOLLOW_UP_QUESTIONS]
+    return [
+        {
+            "user": question,
+            "agent": _qa_answer(
+                question, ordered, rows, policy, backend, model,
+                cands=cands, tools=tools,
+            ),
+        }
+        for question in _FOLLOW_UP_QUESTIONS
+    ]

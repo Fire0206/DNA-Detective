@@ -24,6 +24,12 @@ incoherent to let the answer layer reintroduce it.
 Without a model, the templated answer says the same thing less fluently, from
 the same comparison, with the same citations.
 
+INVESTIGATION MODE (new): when ``cands`` and ``tools`` are provided, Q&A
+becomes an agent. It can fill evidence gaps before answering, and investigate
+ad-hoc variants that were never in the Exomiser shortlist. This directly
+answers the prof's feedback: "if a user asks about a specific variant,
+investigate it" and "reconsider candidates that Exomiser ranks lower."
+
 Usage
 -----
     python3 -m dnadet.qa --ask "why is candidate 1 stronger than candidate 2"
@@ -39,7 +45,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 from .agent import BACKENDS, Assessment, assess, load_rows, now_iso
 from .net import JSON_HEADERS, ssl_context
@@ -52,6 +58,12 @@ ORDINALS = {
     "third": 3, "3rd": 3,
     "fourth": 4, "4th": 4,
     "fifth": 5, "5th": 5,
+}
+
+# Maps assessment gap descriptions to the tool that can fill them.
+GAP_TOOLS: dict[str, str] = {
+    "no clinical interpretation": "clinvar",
+    "consequence unknown": "vep",
 }
 
 
@@ -123,6 +135,121 @@ def build_context(targets: list[Assessment], rows: list[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Investigation - live tool calls when evidence is insufficient
+# --------------------------------------------------------------------------- #
+
+
+def parse_adhoc_variant(question: str) -> Optional[dict[str, Any]]:
+    """Extract variant coordinates from a free-text question.
+
+    Recognises two formats:
+        chrom-pos-ref-alt          (candidate_id style: 10-123256215-T-G)
+        chr10:123256215 T>G        (genomic notation, also T/G)
+    Returns a dict with chrom/pos/ref/alt, or None.
+    """
+    # Format: chrom-pos-ref-alt
+    m = re.search(
+        r'\b(\d{1,2}|[XYM])-(\d+)-([ACGTacgt]+)-([ACGTacgt]+)\b', question)
+    if m:
+        return {"chrom": m.group(1), "pos": int(m.group(2)),
+                "ref": m.group(3).upper(), "alt": m.group(4).upper()}
+    # Format: chr10:123256215 T>G  or  10:123256215 T/G
+    m = re.search(
+        r'(?:chr)?(\d{1,2}|[XYM]):(\d+)\s+([ACGTacgt]+)\s*[>/]\s*([ACGTacgt]+)',
+        question, re.I)
+    if m:
+        return {"chrom": m.group(1), "pos": int(m.group(2)),
+                "ref": m.group(3).upper(), "alt": m.group(4).upper()}
+    return None
+
+
+def _assign_ids(rows: list[dict], prefix: str = "Q") -> None:
+    """Give temporary evidence IDs to rows that have none, so citations work."""
+    n = 0
+    for r in rows:
+        if not r.get("evidence_id"):
+            n += 1
+            r["evidence_id"] = f"{prefix}{n:03d}"
+
+
+def investigate_adhoc(
+    variant: dict[str, Any],
+    tools: dict[str, Any],
+    existing_rows: list[dict],
+) -> tuple[list[Assessment], list[dict]]:
+    """Construct a candidate from coordinates and investigate from scratch.
+
+    This is how DNA Detective goes beyond Exomiser: a variant that Exomiser
+    filtered out can be assessed on demand.
+    """
+    cid = (f"{variant['chrom']}-{variant['pos']}-"
+           f"{variant['ref']}-{variant['alt']}")
+    cand: dict[str, Any] = {
+        "candidate_id": cid,
+        "chrom": variant["chrom"], "pos": variant["pos"],
+        "ref": variant["ref"], "alt": variant["alt"],
+        "gene": "",  # VEP will fill this via side-effect
+    }
+    new_rows: list[dict] = []
+    # VEP first — it fills cand["consequence"] and cand["gene"]
+    for tool_name in ("vep", "clinvar"):
+        if tool_name not in tools:
+            continue
+        try:
+            evidence = tools[tool_name](cand)
+            for ev in evidence:
+                d = ev.to_dict() if hasattr(ev, "to_dict") else ev
+                new_rows.append(d)
+            gene_label = cand.get("gene") or cid
+            print(f"  Q&A investigate: {tool_name} on {gene_label} "
+                  f"-> {len(evidence)} row(s)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! Q&A investigate: {tool_name} on {cid} failed: {exc}")
+
+    _assign_ids(new_rows, prefix="Q")
+    all_rows = existing_rows + new_rows
+    assessment = assess(cand, all_rows)
+    return [assessment], new_rows
+
+
+def fill_gaps(
+    targets: list[Assessment],
+    cands: dict[str, dict],
+    tools: dict[str, Any],
+) -> list[dict]:
+    """Call tools to fill evidence gaps for target candidates before answering.
+
+    Only calls tools that are mapped in GAP_TOOLS and available in ``tools``.
+    Returns the new evidence rows (as dicts).
+    """
+    extra: list[dict] = []
+    for a in targets:
+        if a.candidate_id not in cands:
+            continue
+        cand = cands[a.candidate_id]
+        called: set[str] = set()
+        for gap in a.gaps:
+            for pattern, tool_name in GAP_TOOLS.items():
+                if (pattern in gap
+                        and tool_name in tools
+                        and tool_name not in called):
+                    called.add(tool_name)
+                    try:
+                        evidence = tools[tool_name](cand)
+                        for ev in evidence:
+                            d = (ev.to_dict()
+                                 if hasattr(ev, "to_dict") else ev)
+                            extra.append(d)
+                        print(f"  Q&A gap-fill: {tool_name} on {a.gene} "
+                              f"-> {len(evidence)} row(s)")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  ! Q&A gap-fill: {tool_name} on {a.gene} "
+                              f"failed: {exc}")
+    _assign_ids(extra, prefix="G")
+    return extra
+
+
+# --------------------------------------------------------------------------- #
 # Templated answer - no model required
 # --------------------------------------------------------------------------- #
 
@@ -175,7 +302,7 @@ def template_answer(targets: list[Assessment]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-CITE_RE = re.compile(r"\b([EAC]\d{3})\b")
+CITE_RE = re.compile(r"\b([EACGQ]\d{3})\b")
 
 
 def verify_citations(answer: str, valid: set[str]) -> tuple[str, list[str]]:
@@ -247,8 +374,55 @@ def llm_answer(question: str, context: dict, backend: str, model: str) -> Option
 
 
 def answer(question: str, ranked: list[Assessment], rows: list[dict],
-           policy: str, backend: str, model: str) -> str:
+           policy: str, backend: str, model: str, *,
+           cands: Optional[dict[str, dict]] = None,
+           tools: Optional[dict[str, Any]] = None) -> str:
+    """Answer a follow-up question.
+
+    Without ``cands``/``tools``: pure retrieval from stored evidence (original
+    behaviour, fully backwards-compatible).
+
+    With ``cands``/``tools``: investigation mode. The system fills evidence gaps
+    before answering and can assess ad-hoc variants that were never in the
+    Exomiser shortlist.
+    """
     targets = resolve_targets(question, ranked)
+
+    # --- Investigation mode --------------------------------------------------
+    if cands is not None and tools:
+        # Ad-hoc variant: the question names a variant not in the ranked list.
+        # Investigate it from scratch — this is how DNA Detective goes beyond
+        # Exomiser's shortlist.
+        if not targets:
+            variant = parse_adhoc_variant(question)
+            if variant:
+                cid = (f"{variant['chrom']}-{variant['pos']}-"
+                       f"{variant['ref']}-{variant['alt']}")
+                # If these coordinates match a shortlisted candidate, use the
+                # existing (richer) assessment instead of building a weaker one
+                existing = [a for a in ranked if a.candidate_id == cid]
+                if existing:
+                    targets = existing
+                else:
+                    targets, extra = investigate_adhoc(variant, tools, rows)
+                    rows = list(rows) + extra  # copy — don't mutate caller's list
+
+        # Gap-filling: resolved targets have gaps a tool can address. Fill them
+        # before answering so the response reflects the best available evidence.
+        if targets:
+            extra = fill_gaps(targets, cands, tools)
+            if extra:
+                rows = list(rows) + extra
+                # Re-assess with enriched evidence
+                reassessed = []
+                for a in targets:
+                    if a.candidate_id in cands:
+                        reassessed.append(assess(cands[a.candidate_id], rows))
+                    else:
+                        reassessed.append(a)
+                targets = sorted(reassessed, key=lambda a: a.sort_key)
+    # -------------------------------------------------------------------------
+
     if not targets:
         return template_answer([])
 
