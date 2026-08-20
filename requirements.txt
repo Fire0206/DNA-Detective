@@ -1,3 +1,7 @@
-# The initial skeleton uses only the Python standard library.
+# The pipeline itself (main.py, src/, dnadet/) uses only the Python standard
+# library and needs nothing installed. The dependency below is required only by
+# the Streamlit frontend in app.py.
+#
 # Add pinned runtime dependencies here only when a collaborator needs them.
 
+streamlit==1.61.1
