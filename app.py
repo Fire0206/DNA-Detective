@@ -53,17 +53,53 @@ def init_qa():
     from dnadet.agent import assess, TOOLS
     from dnadet.tools.vep import annotate_candidate
     from dnadet.tools.clinical import process as clinvar_process
+    from dnadet.tools.pubmed import search_candidate as pubmed_search
+    from dnadet.tools.spliceai import predict_splice
 
     # Register live tools
     TOOLS["clinvar"] = (
         lambda c: clinvar_process([c], "outputs/agent_cache", False, 1)[0])
     TOOLS["vep"] = lambda c: annotate_candidate(c)
+    TOOLS["pubmed"] = lambda c: pubmed_search(c, cache_dir="outputs/agent_cache/pubmed")
+    TOOLS["splice"] = lambda c: predict_splice(c, cache_dir="outputs/agent_cache/spliceai")
+
+    from dnadet.tools.alphamissense import lookup_alphamissense
+    TOOLS["alphamissense"] = lambda c: lookup_alphamissense(c, cache_dir="outputs/agent_cache/alphamissense")
 
     # Shortlist + offline evidence (no network calls)
     case = load_case(Path("data/Pfeiffer.vcf"),
                      Path("data/pfeiffer-phenopacket.yml"))
     candidates = generate_candidate_shortlist(case, limit=10)
     evidence = list(shortlist_evidence())
+
+    # Also load agent evidence from the report (if it exists) so the Q&A
+    # doesn't re-trigger gap-fill for evidence the agent already gathered.
+    report_path = Path("outputs/dna_detective_report.json")
+    if report_path.exists():
+        import json as _json
+        with open(report_path) as _f:
+            report_data = _json.load(_f)
+        for ev in report_data.get("evidence_log", []):
+            # Only add rows not already in offline evidence (agent-produced)
+            if ev.get("evidence_id", "").startswith("A"):
+                from src.models import Evidence as _Ev
+                evidence.append(_Ev(
+                    evidence_id=ev.get("evidence_id", ""),
+                    candidate_id=ev.get("candidate_id", ""),
+                    category=ev.get("category", ""),
+                    source=ev.get("source", ""),
+                    record_or_accession=ev.get("record_or_accession", ""),
+                    query=ev.get("query", ""),
+                    assembly=ev.get("assembly", "GRCh37"),
+                    transcript=ev.get("transcript"),
+                    raw_field=ev.get("raw_field", ""),
+                    raw_value=ev.get("raw_value", ""),
+                    tool_or_data_version=ev.get("tool_or_data_version", ""),
+                    url=ev.get("url", ""),
+                    retrieved_at=ev.get("retrieved_at", ""),
+                    interpretation=ev.get("interpretation", ""),
+                    limitations=ev.get("limitations", []),
+                ))
 
     cand_dicts = [bridge.to_engine_dict(c) for c in candidates]
     rows = bridge.evidence_as_dicts(evidence)
@@ -231,21 +267,107 @@ def render_qa() -> None:
                     tools=st.session_state.qa_tools,
                 )
 
-            # If the system couldn't resolve anything, give a helpful
-            # conversational fallback instead of the terse default.
+            # If the system couldn't resolve anything, check if they're
+            # asking about the ranking overview before falling back.
             if response.startswith("I could not tell"):
                 ranked = st.session_state.qa_ranked
-                gene_list = ", ".join(a.gene for a in ranked[:5] if a.gene)
-                response = (
-                    f"I can answer questions about specific candidates in the "
-                    f"ranking — try naming a gene ({gene_list}), a rank "
-                    f"(*candidate 1*), or paste coordinates for any variant "
-                    f"(e.g. `chr10:123256215 T>G`).\n\n"
-                    f"**Some things you can ask:**\n"
-                    f"- Why is {ranked[0].gene} ranked first?\n"
-                    f"- Is the evidence for {ranked[1].gene} independent?\n"
-                    f"- What about chr5:179612 G>A? *(investigates a new variant live)*"
-                )
+                q_lower = question.lower()
+
+                # Ranking overview questions
+                if any(w in q_lower for w in (
+                    "ranking", "ranked", "list", "candidates", "all",
+                    "summary", "overview", "results", "show me",
+                    "what are", "how many",
+                )):
+                    lines = ["**Current ranking** "
+                             f"({len(ranked)} candidates, ranked by "
+                             "independent evidence strength):\n"]
+                    for a in ranked:
+                        gaps_short = (f" — gaps: {', '.join(a.gaps[:2])}"
+                                      if a.gaps else "")
+                        circ = " ⚠️ circularity" if a.circularity else ""
+                        lines.append(
+                            f"| **#{ranked.index(a)+1}** | **{a.gene}** "
+                            f"| `{a.candidate_id}` | strength {a.strength} "
+                            f"| {a.independent_support} independent lines "
+                            f"| {a.conflicts} conflicts"
+                            f"{circ}{gaps_short} |"
+                        )
+                    lines.append(
+                        f"\nAsk about any candidate by gene name or rank "
+                        f"for a detailed breakdown.")
+                    response = "\n".join(lines)
+
+                # Methodology / concept questions
+                elif any(w in q_lower for w in (
+                    "grch37", "grch38", "genome build", "assembly",
+                    "clinvar", "vep", "pubmed", "spliceai",
+                    "alphamissense", "exomiser", "gnomad",
+                    "how does", "how do you", "what does", "what is",
+                    "what are", "tell me about", "explain",
+                    "methodology", "pipeline", "how it works",
+                    "what tools", "dna detective", "about this",
+                    "what can you", "help",
+                )):
+                    concepts = {
+                        "dna detective": "**DNA Detective** takes Exomiser's ranked variant list and builds an independent, evidence-traced case for each candidate. It checks 6 evidence sources (ClinVar, VEP, PubMed, SpliceAI, AlphaMissense, gnomAD), detects when the same evidence is counted multiple times (circularity), verifies ClinVar by exact allele not just position, and can investigate any variant on demand — even ones Exomiser filtered out.",
+                        "grch37": "**GRCh37** (hg19) is the human genome reference build this patient's VCF is aligned to. It's an older version — GRCh38 is current. We use `grch37.rest.ensembl.org` for VEP calls specifically because the default endpoint uses GRCh38, which would silently return annotations for the wrong genomic position.",
+                        "grch38": "**GRCh38** (hg38) is the current human genome reference build. This patient's data is on GRCh37, so we query Ensembl's GRCh37 endpoint specifically. Using the default GRCh38 endpoint would give results for the wrong position.",
+                        "clinvar": "**ClinVar** is NCBI's public database where genetics labs submit whether a variant is pathogenic, benign, or uncertain. We check both the classification and the review status (star rating: 1★ = one lab, 2★ = multiple labs agree, 3★ = expert panel). We verify by exact allele, not just position — this caught 3 wrong-allele matches in our candidates.",
+                        "vep": "**VEP** (Variant Effect Predictor) is Ensembl's tool that tells us what a DNA change does to the protein — missense (changes amino acid), splice region (near splicing junction), synonymous (no change), etc. Seven of our candidates had no consequence annotation until VEP filled the gap.",
+                        "pubmed": "**PubMed** is NCBI's medical literature database. We search for gene+disease and gene+variant publications. FGFR2 returned 136 publications linking it to Pfeiffer syndrome — this is genuinely independent evidence that Exomiser doesn't provide.",
+                        "spliceai": "**SpliceAI** predicts whether a variant near a splice site actually disrupts splicing (delta scores 0-1). It uses deep learning on pre-mRNA sequences — different methodology from missense predictors. The Broad Institute's API is currently down server-side; we fall back to VEP and report the gap.",
+                        "alphamissense": "**AlphaMissense** predicts missense pathogenicity using AlphaFold protein 3D structure. It's methodologically independent from REVEL/MVP (which use sequence conservation), so agreement between them is more meaningful than agreement among sequence-based predictors alone.",
+                        "exomiser": "**Exomiser** is the upstream tool that filtered ~37,000 variants down to 11 candidates. DNA Detective takes those 11 and builds an independent, evidence-traced ranking. We don't re-do Exomiser's filtering, but we rank independently and can investigate any variant on demand — even ones Exomiser filtered out.",
+                        "gnomad": "**gnomAD** (Genome Aggregation Database) contains variant frequencies from ~140,000 healthy individuals. If a variant is common in gnomAD, it's unlikely to cause a rare disease. Our gnomAD tool is currently a stub — we use Exomiser's 2-year-old snapshot and disclose this as a limitation.",
+                    }
+                    matched_concepts = [
+                        v for k, v in concepts.items()
+                        if k in q_lower
+                    ]
+                    if matched_concepts:
+                        response = "\n\n".join(matched_concepts)
+                    elif any(w in q_lower for w in (
+                        "how does", "how do you", "pipeline",
+                        "how it works", "what tools", "methodology",
+                    )):
+                        response = (
+                            "**How DNA Detective works:**\n\n"
+                            "1. Exomiser filters ~37,000 variants → 11 "
+                            "candidates\n"
+                            "2. Our agent checks each candidate against "
+                            "6 evidence sources: ClinVar, VEP, PubMed, "
+                            "SpliceAI, AlphaMissense, and gnomAD\n"
+                            "3. It picks tools selectively — the tool "
+                            "that most affects the ranking gets called "
+                            "first\n"
+                            "4. Each candidate is assessed across 6 "
+                            "evidence families with independence checks "
+                            "and circularity detection\n"
+                            "5. The ranking is based on weighted, "
+                            "origin-collapsed evidence strength\n\n"
+                            "Ask about a specific candidate for details, "
+                            "or type coordinates to investigate any "
+                            "variant live."
+                        )
+                    else:
+                        response = matched_concepts[0] if matched_concepts else response
+
+                else:
+                    gene_list = ", ".join(
+                        a.gene for a in ranked[:5] if a.gene)
+                    response = (
+                        f"I can answer questions about specific candidates "
+                        f"in the ranking — try naming a gene ({gene_list}),"
+                        f" a rank (*candidate 1*), or paste coordinates for"
+                        f" any variant (e.g. `chr10:123256215 T>G`).\n\n"
+                        f"**Some things you can ask:**\n"
+                        f"- Why is {ranked[0].gene} ranked first?\n"
+                        f"- Is the evidence for {ranked[1].gene} "
+                        f"independent?\n"
+                        f"- What about chr5:179612 G>A? *(investigates a "
+                        f"new variant live)*"
+                    )
 
             st.markdown(response)
 
