@@ -16,6 +16,8 @@ from pathlib import Path
 
 import streamlit as st
 
+import re
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ def init_qa():
     """
     from src.pipeline.case_loader import load_case
     from src.pipeline.prioritization import (
-        generate_candidate_shortlist, shortlist_evidence,
+        generate_candidate_shortlist, shortlist_evidence, shortlist_drops,
     )
     from src import bridge
     from dnadet.agent import assess, TOOLS
@@ -107,7 +109,13 @@ def init_qa():
         [assess(c, rows) for c in cand_dicts], key=lambda a: a.sort_key)
     cand_map = {c["candidate_id"]: c for c in cand_dicts}
 
-    return ranked, rows, cand_map, TOOLS
+    # Load drops for the filtered-variants section
+    try:
+        drops = list(shortlist_drops())
+    except Exception:
+        drops = []
+
+    return ranked, rows, cand_map, TOOLS, drops
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +138,29 @@ def render_ranking(report: dict) -> None:
     col1.metric("Candidates ranked", len(candidates))
     col2.metric("Evidence rows", len(all_evidence))
     col3.metric("Tools used", len((report.get("method") or {}).get("tools", [])))
+
+    st.divider()
+
+    # Summary ranking table (quick overview before the detail cards)
+    st.markdown("### Variant ranking")
+    tbl = ["| Rank | Variant | Gene | Strength | Indep. Lines "
+           "| Confidence |",
+           "|---|---|---|---|---|---|"]
+    for c in candidates:
+        reason = c.get("reason_for_rank", "")
+        sm = re.match(
+            r"evidence strength (\d+) from (\d+) independent", reason)
+        strength = sm.group(1) if sm else "?"
+        indep = sm.group(2) if sm else "?"
+        conf = c.get("confidence", "?")
+        if isinstance(conf, float):
+            conf = f"{conf:.2f}"
+        tbl.append(
+            f"| {c.get('rank', '?')} "
+            f"| `{c.get('candidate_id', '')}` "
+            f"| {c.get('gene', '?')} "
+            f"| {strength} | {indep} | {conf} |")
+    st.markdown("\n".join(tbl))
 
     st.divider()
 
@@ -170,6 +201,46 @@ def render_ranking(report: dict) -> None:
             for lim in lims:
                 st.markdown(f"- {lim}")
 
+        # Dropped variants
+    if "qa_drops" in st.session_state and st.session_state.qa_drops:
+        drops = st.session_state.qa_drops
+        with st.expander(
+            f"🔍 Filtered variants ({len(drops)} with per-variant reasons)"
+        ):
+            st.caption(
+                "Exomiser filtered ~37,000 variants down to ~280 "
+                "candidates. The top 11 became the shortlist above. "
+                f"These {len(drops)} variants passed Exomiser's quality "
+                "and frequency filters but ranked too low to make the "
+                "final cut. You can investigate any of them by pasting "
+                "coordinates in the Q&A tab.")
+            drop_lines = [
+                "| Gene | Variant | Reason |",
+                "|---|---|---|",
+            ]
+            for d in drops:
+                if hasattr(d, "to_dict"):
+                    d = d.to_dict()
+                elif hasattr(d, "__dict__"):
+                    d = vars(d)
+                elif not isinstance(d, dict):
+                    d = {"info": str(d)}
+                gene = d.get("gene", d.get("gene_symbol", ""))
+                if not gene:
+                    reason_text = str(
+                        d.get("reason", d.get("drop_reason", "")))
+                    gm = re.search(r"gene (\S+)", reason_text)
+                    gene = gm.group(1) if gm else "?"
+                cid = d.get("candidate_id", d.get("variant_id", "?"))
+                reason = str(
+                    d.get("reason", d.get("drop_reason",
+                           d.get("info", "not specified"))))
+                # Escape pipes in reason text
+                reason = reason.replace("|", "∣")
+                drop_lines.append(
+                    f"| {gene} | `{cid}` | {reason} |")
+            st.markdown("\n".join(drop_lines))
+
     # Pre-generated follow-ups
     examples = report.get("follow_up_examples", [])
     if examples:
@@ -185,33 +256,149 @@ def render_ranking(report: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-SUGGESTIONS = [
-    "Why is candidate 1 stronger than candidate 2?",
-    "Is the evidence for ENPP1 independent?",
-    "What is still missing for FGFR2?",
-    "What about chr3:38622160 G>A?",
-]
+def _suggestions(ranked: list | None = None) -> list[str]:
+    """Dynamic suggestion buttons using gene names from the ranking."""
+    if not ranked or len(ranked) < 2:
+        return [
+            "Show me the ranking",
+            "What tools does DNA Detective use?",
+            "How does the pipeline work?",
+        ]
+    top, second = ranked[0].gene, ranked[1].gene
+    return [
+        f"Why is the {top} variant ranked first?",
+        f"Is the {second} variant's evidence independent?",
+        f"What evidence is missing for the {top} variant?",
+        "Investigate chr3:38622160 G>A",
+    ]
 
+# ---------------------------------------------------------------------------
+# Agent thinking
+# ---------------------------------------------------------------------------
+
+
+TRANSCRIPT_PATH = Path("docs/transcripts/agent_transcript.md")
+
+
+def render_agent_thinking() -> None:
+    """Display the agent's step-by-step ReAct reasoning process."""
+    if not TRANSCRIPT_PATH.exists():
+        st.info(
+            "No agent transcript found. Run the pipeline with "
+            "`--agent` to generate one.")
+        return
+
+    content = TRANSCRIPT_PATH.read_text(encoding="utf-8")
+
+    # Split into step blocks at "### Step N"
+    parts = re.split(r"(?=### Step \d+)", content)
+    header = parts[0].strip() if parts else ""
+    steps = [p for p in parts if re.match(r"### Step \d+", p.strip())]
+
+    # --- metrics row ---------------------------------------------------------
+    col1, col2 = st.columns(2)
+    col1.metric("Agent steps", len(steps))
+
+    # Extract stop reason from the last step
+    if steps:
+        last = steps[-1]
+        stop_match = re.search(
+            r"\*\*PRIORITIZE\*\* -> stop.*?\n>\s*(.+?)(?:\n|$)", last,
+            re.DOTALL)
+        if stop_match:
+            reason_text = stop_match.group(1).strip()
+            col2.metric(
+                "Conclusion",
+                reason_text[:70] + "…" if len(reason_text) > 70
+                else reason_text)
+
+    st.divider()
+
+    # --- timeline summary (quick-glance table) -------------------------------
+    summary_lines = [
+        "| Step | Action | Target | Outcome |",
+        "|---|---|---|---|",
+    ]
+    for i, step_text in enumerate(steps, 1):
+        is_stop = "**STOP.**" in step_text
+
+        if is_stop:
+            summary_lines.append(f"| {i} | 🛑 STOP | — | — |")
+            continue
+
+        # Parse the PRIORITIZE line
+        act = re.search(
+            r"\*\*PRIORITIZE\*\* -> \S+\s+(\S+)\s+(\S+)", step_text)
+        if act:
+            tool, cid = act.group(1), act.group(2)
+            gene_m = re.search(
+                rf"\*\*(\w+)\*\*\s*`{re.escape(cid)}`", step_text)
+            gene = gene_m.group(1) if gene_m else cid
+        else:
+            tool, gene = "?", "?"
+
+        # Parse COMPARE outcome (first line after **COMPARE**)
+        comp = re.search(
+            r"\*\*COMPARE\*\*\s*-\s*\w+:\s*(.+?)(?:\n|$)", step_text)
+        outcome = comp.group(1).strip()[:60] if comp else "—"
+        if comp and len(comp.group(1).strip()) > 60:
+            outcome += "…"
+
+        summary_lines.append(
+            f"| {i} | 🔧 {tool} | **{gene}** | {outcome} |")
+
+    st.markdown("\n".join(summary_lines))
+
+    st.divider()
+
+    # --- expandable step details ---------------------------------------------
+    st.markdown("##### Step details")
+    for i, step_text in enumerate(steps, 1):
+        is_stop = "**STOP.**" in step_text
+
+        if is_stop:
+            label = f"Step {i}: 🛑 STOP"
+        else:
+            act = re.search(
+                r"\*\*PRIORITIZE\*\* -> \S+\s+(\S+)\s+(\S+)", step_text)
+            if act:
+                tool, cid = act.group(1), act.group(2)
+                gene_m = re.search(
+                    rf"\*\*(\w+)\*\*\s*`{re.escape(cid)}`", step_text)
+                gene = gene_m.group(1) if gene_m else cid
+                label = f"Step {i}: {tool} → {gene}"
+            else:
+                label = f"Step {i}"
+
+        with st.expander(label, expanded=(i == len(steps))):
+            st.markdown(step_text)
+
+    # --- final ranking section (if present) ----------------------------------
+    if "## Final ranking" in content:
+        final_text = content[content.index("## Final ranking"):]
+        with st.expander("📊 Final ranking summary", expanded=False):
+            st.markdown(final_text)
 
 def render_qa() -> None:
     """Chat interface with live tool investigation."""
     st.markdown(
-        "Ask about any ranked candidate by **gene name** or **rank** "
-        "(e.g. *candidate 1*, *ENPP1*).  \n"
-        "Or type **coordinates** for a variant not in the shortlist "
-        "(e.g. `5-179612-G-A`, `chr10:123256215 T>G`) — DNA Detective "
-        "will investigate it live."
+        "Ask about any **variant** using its gene name "
+        "(e.g. *FGFR2*, *ENPP1*) or coordinates "
+        "(e.g. `chr3:38622160 G>A`).  \n"
+        "Each ranked entry is a specific variant, not a gene — "
+        "the gene name is a shorthand for the variant within it."
     )
 
     # Lazy-init Q&A engine
     if "qa_ready" not in st.session_state:
         with st.spinner("Loading Q&A engine…"):
-            ranked, rows, cand_map, tools = init_qa()
+            ranked, rows, cand_map, tools, drops = init_qa()
         st.session_state.qa_ranked = ranked
         st.session_state.qa_rows = rows
         st.session_state.qa_cand_map = cand_map
         st.session_state.qa_tools = tools
         st.session_state.qa_ready = True
+        st.session_state.qa_drops = drops
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -228,10 +415,11 @@ def render_qa() -> None:
         else:
             qa_backend = ""
 
-    # Suggestion chips
+    # Dynamic suggestion chips
+    suggestions = _suggestions(st.session_state.get("qa_ranked"))
     st.caption("Try one of these:")
-    cols = st.columns(len(SUGGESTIONS))
-    for i, sug in enumerate(SUGGESTIONS):
+    cols = st.columns(len(suggestions))
+    for i, sug in enumerate(suggestions):
         if cols[i].button(sug, key=f"sug_{i}", use_container_width=True):
             st.session_state.pending_q = sug
 
@@ -240,7 +428,43 @@ def render_qa() -> None:
     # Chat history
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg.get("thinking"):
+                for step in msg["thinking"]:
+                    st.caption(step)
+
+            content = msg["content"]
+            cite_text = ""
+            for marker in ("\n\n*\u2713 ", "\n\n*\u26a0\ufe0f "):
+                idx = content.rfind(marker)
+                if idx >= 0:
+                    cite_text = content[idx + 2:].rstrip().rstrip("*")
+                    content = content[:idx]
+                    break
+
+            st.markdown(content)
+
+            if cite_text:
+                cited_ids = sorted(set(
+                    re.findall(r"\b([EACGQ]\d{3})\b", content)))
+                if cited_ids and "qa_rows" in st.session_state:
+                    with st.expander(cite_text, expanded=False):
+                        for eid in cited_ids:
+                            row = next(
+                                (r for r in st.session_state.qa_rows
+                                 if r.get("evidence_id") == eid),
+                                None)
+                            if row:
+                                cat = row.get("category", "?")
+                                src = row.get("source", "?")
+                                interp = (
+                                    row.get("interpretation", "")
+                                    [:150])
+                                if len(row.get(
+                                    "interpretation", "")) > 150:
+                                    interp += "\u2026"
+                                st.caption(
+                                    f"**[{eid}]** {cat} \u00b7 {src}: "
+                                    f"{interp}")
 
     # Determine the next question
     question = st.chat_input("Ask DNA Detective…")
@@ -257,15 +481,113 @@ def render_qa() -> None:
             from dnadet.qa import answer as qa_answer
 
             policy = "llm" if use_llm else "template"
-            with st.spinner("Investigating…"):
-                response = qa_answer(
-                    question,
-                    st.session_state.qa_ranked,
-                    st.session_state.qa_rows,
-                    policy, qa_backend, "",
-                    cands=st.session_state.qa_cand_map,
-                    tools=st.session_state.qa_tools,
-                )
+            tool_log: list[str] = []
+
+            with st.status("🧬 Investigating…", expanded=True) as status:
+                def _progress(msg: str) -> None:
+                    status.caption(msg)
+                    tool_log.append(msg)
+
+                # Pre-check: questions about absent variants should not go
+                # through qa_answer, which defaults to the top two.
+                q_lower = question.lower()
+                skip_qa = False
+                if any(w in q_lower for w in (
+                    "isn't", "is not", "not in the list",
+                    "not in the ranking", "why not",
+                    "where is", "missing from", "excluded",
+                    "dropped", "filtered", "removed",
+                )):
+                    skip_qa = True
+                    _progress("🔍 Checking filtered variants…")
+                    drops = st.session_state.get("qa_drops", [])
+                    gene_hit = None
+                    for d in drops:
+                        dd = (d.to_dict() if hasattr(d, "to_dict")
+                              else vars(d) if hasattr(d, "__dict__")
+                              else d if isinstance(d, dict) else {})
+                        g = dd.get("gene", dd.get("gene_symbol", ""))
+                        if g and g.lower() in q_lower:
+                            gene_hit = dd
+                            break
+
+                    if gene_hit:
+                        g = gene_hit.get(
+                            "gene", gene_hit.get("gene_symbol", "?"))
+                        r = gene_hit.get(
+                            "reason", gene_hit.get(
+                                "drop_reason", "no reason recorded"))
+                        cid = gene_hit.get(
+                            "candidate_id",
+                            gene_hit.get("variant_id", "?"))
+                        response = (
+                            f"**{g}** (`{cid}`) was filtered by Exomiser: "
+                            f"{r}\n\n"
+                            "You can still investigate it — paste its "
+                            "coordinates in this chat and DNA Detective "
+                            "will run VEP, ClinVar, and PubMed on it live.")
+                    else:
+                        # Extract a gene name from the question for a
+                        # targeted response.
+                        words = [w.strip("?.,!:;()") for w in question.split()]
+                        words = [w for w in words
+                                 if w and w.upper() == w and len(w) >= 3
+                                 and w not in ("THE", "NOT", "WHY")]
+                        gene_guess = words[0] if words else None
+                        if gene_guess:
+                            response = (
+                                f"**{gene_guess}** is not in the current "
+                                "shortlist. Exomiser filtered ~37,000 "
+                                "variants down to 11 candidates, and "
+                                f"{gene_guess} did not survive that "
+                                "process.\n\nIf you have the variant's "
+                                "coordinates, paste them here (e.g. "
+                                "`chr17:41245466 G>A`) and DNA Detective "
+                                "will investigate it live — even if "
+                                "Exomiser filtered it out.")
+                        elif drops:
+                            response = (
+                                "Exomiser filtered ~37,000 variants in "
+                                f"total. Of these, **{len(drops)}** have "
+                                "per-variant drop reasons (they passed "
+                                "initial filters but were removed in later "
+                                "stages). The rest were removed in bulk "
+                                "during earlier filter stages without "
+                                "per-variant tracking.\n\n"
+                                "Check the **Filtered variants** section "
+                                "in the Ranking tab to browse the ones "
+                                "with reasons.\n\n"
+                                "To investigate any specific variant, "
+                                "paste its coordinates here (e.g. "
+                                "`chr3:38622160 G>A`) — DNA Detective "
+                                "will assess it live.")
+                        else:
+                            response = (
+                                "That variant is not in the current "
+                                "shortlist. Exomiser filtered ~37,000 "
+                                "variants down to 11.\n\nPaste the "
+                                "variant's coordinates to investigate "
+                                "it live.")
+
+                if not skip_qa:
+                    response = qa_answer(
+                        question,
+                        st.session_state.qa_ranked,
+                        st.session_state.qa_rows,
+                        policy, qa_backend, "",
+                        cands=st.session_state.qa_cand_map,
+                        tools=st.session_state.qa_tools,
+                        progress=_progress,
+                    )
+
+                if any("🔧" in m for m in tool_log):
+                    status.update(
+                        label="✅ Investigation complete",
+                        state="complete", expanded=True)
+                else:
+                    status.update(
+                        label="💭 Done",
+                        state="complete", expanded=True)
 
             # If the system couldn't resolve anything, check if they're
             # asking about the ranking overview before falling back.
@@ -279,23 +601,28 @@ def render_qa() -> None:
                     "summary", "overview", "results", "show me",
                     "what are", "how many",
                 )):
-                    lines = ["**Current ranking** "
-                             f"({len(ranked)} candidates, ranked by "
-                             "independent evidence strength):\n"]
-                    for a in ranked:
-                        gaps_short = (f" — gaps: {', '.join(a.gaps[:2])}"
-                                      if a.gaps else "")
-                        circ = " ⚠️ circularity" if a.circularity else ""
+                    lines = [
+                        f"**Current ranking** ({len(ranked)} candidates, "
+                        "ranked by independent evidence strength):\n",
+                        "| Rank | Gene | Strength | Independent | "
+                        "Conflicts | Notes |",
+                        "|---|---|---|---|---|---|",
+                    ]
+                    for i, a in enumerate(ranked, 1):
+                        notes_parts = []
+                        if a.circularity:
+                            notes_parts.append("⚠️ circularity")
+                        if a.gaps:
+                            notes_parts.append(
+                                f"gaps: {', '.join(a.gaps[:2])}")
+                        notes = "; ".join(notes_parts) or "—"
                         lines.append(
-                            f"| **#{ranked.index(a)+1}** | **{a.gene}** "
-                            f"| `{a.candidate_id}` | strength {a.strength} "
-                            f"| {a.independent_support} independent lines "
-                            f"| {a.conflicts} conflicts"
-                            f"{circ}{gaps_short} |"
-                        )
+                            f"| {i} | **{a.gene}** | {a.strength} "
+                            f"| {a.independent_support} | {a.conflicts} "
+                            f"| {notes} |")
                     lines.append(
-                        f"\nAsk about any candidate by gene name or rank "
-                        f"for a detailed breakdown.")
+                        "\nAsk about any variant by gene name or "
+                        "coordinates for a detailed breakdown.")
                     response = "\n".join(lines)
 
                 # Methodology / concept questions
@@ -310,16 +637,93 @@ def render_qa() -> None:
                     "what can you", "help",
                 )):
                     concepts = {
-                        "dna detective": "**DNA Detective** takes Exomiser's ranked variant list and builds an independent, evidence-traced case for each candidate. It checks 6 evidence sources (ClinVar, VEP, PubMed, SpliceAI, AlphaMissense, gnomAD), detects when the same evidence is counted multiple times (circularity), verifies ClinVar by exact allele not just position, and can investigate any variant on demand — even ones Exomiser filtered out.",
-                        "grch37": "**GRCh37** (hg19) is the human genome reference build this patient's VCF is aligned to. It's an older version — GRCh38 is current. We use `grch37.rest.ensembl.org` for VEP calls specifically because the default endpoint uses GRCh38, which would silently return annotations for the wrong genomic position.",
-                        "grch38": "**GRCh38** (hg38) is the current human genome reference build. This patient's data is on GRCh37, so we query Ensembl's GRCh37 endpoint specifically. Using the default GRCh38 endpoint would give results for the wrong position.",
-                        "clinvar": "**ClinVar** is NCBI's public database where genetics labs submit whether a variant is pathogenic, benign, or uncertain. We check both the classification and the review status (star rating: 1★ = one lab, 2★ = multiple labs agree, 3★ = expert panel). We verify by exact allele, not just position — this caught 3 wrong-allele matches in our candidates.",
-                        "vep": "**VEP** (Variant Effect Predictor) is Ensembl's tool that tells us what a DNA change does to the protein — missense (changes amino acid), splice region (near splicing junction), synonymous (no change), etc. Seven of our candidates had no consequence annotation until VEP filled the gap.",
-                        "pubmed": "**PubMed** is NCBI's medical literature database. We search for gene+disease and gene+variant publications. FGFR2 returned 136 publications linking it to Pfeiffer syndrome — this is genuinely independent evidence that Exomiser doesn't provide.",
-                        "spliceai": "**SpliceAI** predicts whether a variant near a splice site actually disrupts splicing (delta scores 0-1). It uses deep learning on pre-mRNA sequences — different methodology from missense predictors. The Broad Institute's API is currently down server-side; we fall back to VEP and report the gap.",
-                        "alphamissense": "**AlphaMissense** predicts missense pathogenicity using AlphaFold protein 3D structure. It's methodologically independent from REVEL/MVP (which use sequence conservation), so agreement between them is more meaningful than agreement among sequence-based predictors alone.",
-                        "exomiser": "**Exomiser** is the upstream tool that filtered ~37,000 variants down to 11 candidates. DNA Detective takes those 11 and builds an independent, evidence-traced ranking. We don't re-do Exomiser's filtering, but we rank independently and can investigate any variant on demand — even ones Exomiser filtered out.",
-                        "gnomad": "**gnomAD** (Genome Aggregation Database) contains variant frequencies from ~140,000 healthy individuals. If a variant is common in gnomAD, it's unlikely to cause a rare disease. Our gnomAD tool is currently a stub — we use Exomiser's 2-year-old snapshot and disclose this as a limitation.",
+                        "dna detective": (
+                            "**DNA Detective** analyses genetic variants "
+                            "to find which one most likely explains a "
+                            "patient's symptoms. It checks multiple "
+                            "independent databases (clinical records, "
+                            "published research, population data, "
+                            "computational predictions) and flags when "
+                            "evidence that looks independent actually "
+                            "comes from the same source."),
+                        "grch37": (
+                            "**GRCh37** is the coordinate system used to "
+                            "locate positions in this patient's genome — "
+                            "like a street address for DNA. It's an older "
+                            "but widely-used version (the newer one is "
+                            "GRCh38). We specifically use the GRCh37 "
+                            "version of our tools because the patient's "
+                            "data was mapped to this coordinate system. "
+                            "Using the wrong version would look up the "
+                            "wrong location."),
+                        "grch38": (
+                            "**GRCh38** is the newer genome coordinate "
+                            "system. This patient's data uses the older "
+                            "GRCh37, so all our lookups use GRCh37 "
+                            "endpoints to avoid checking the wrong "
+                            "location."),
+                        "clinvar": (
+                            "**ClinVar** is a public database where "
+                            "genetics laboratories report whether a "
+                            "variant is disease-causing (pathogenic), "
+                            "harmless (benign), or uncertain. The star "
+                            "rating indicates how many labs agree: "
+                            "1★ = one lab's opinion, 2★ = multiple labs "
+                            "agree, 3★ = expert panel reviewed. We also "
+                            "verify that the exact DNA change matches, "
+                            "not just the position — this caught 3 "
+                            "wrong matches in our analysis."),
+                        "vep": (
+                            "**VEP** (Variant Effect Predictor) tells us "
+                            "what a DNA change does to the protein it "
+                            "codes for. For example: does it change an "
+                            "amino acid (missense), disrupt splicing, or "
+                            "have no effect (synonymous)? This is needed "
+                            "to even begin assessing whether a variant "
+                            "could cause disease."),
+                        "pubmed": (
+                            "**PubMed** is a database of published "
+                            "medical research. We search it to see if "
+                            "other researchers have studied this gene or "
+                            "variant in relation to the patient's "
+                            "condition. A gene with hundreds of relevant "
+                            "papers is much better understood than one "
+                            "with none. Note: we check whether papers "
+                            "exist and count them, but do not read the "
+                            "full text of each paper."),
+                        "spliceai": (
+                            "**SpliceAI** predicts whether a variant "
+                            "disrupts RNA splicing — the process that "
+                            "removes non-coding sections from the "
+                            "genetic message before it's read. A splice "
+                            "disruption can be just as damaging as "
+                            "changing an amino acid. The SpliceAI "
+                            "service is currently unavailable (server-"
+                            "side issue), so we report this gap rather "
+                            "than hiding it."),
+                        "alphamissense": (
+                            "**AlphaMissense** uses 3D protein structure "
+                            "(from AlphaFold) to predict whether an "
+                            "amino acid change is harmful. It works "
+                            "differently from other predictors that use "
+                            "DNA sequence patterns, so when they agree, "
+                            "that agreement means more."),
+                        "exomiser": (
+                            "**Exomiser** is the upstream tool that "
+                            "narrowed ~37,000 variants down to a "
+                            "manageable shortlist. DNA Detective then "
+                            "builds its own independent case for each "
+                            "survivor. You can also investigate any "
+                            "variant Exomiser filtered out by pasting "
+                            "its coordinates in this chat."),
+                        "gnomad": (
+                            "**gnomAD** is a database of genetic "
+                            "variants seen in ~140,000 healthy people. "
+                            "If a variant is common in gnomAD, it's "
+                            "unlikely to cause a rare disease. Our "
+                            "gnomAD data comes from a snapshot that's "
+                            "about 2 years old — we disclose this as a "
+                            "limitation."),
                     }
                     matched_concepts = [
                         v for k, v in concepts.items()
@@ -356,23 +760,59 @@ def render_qa() -> None:
                 else:
                     gene_list = ", ".join(
                         a.gene for a in ranked[:5] if a.gene)
+                    top = ranked[0].gene if ranked else "?"
+                    second = ranked[1].gene if len(ranked) > 1 else "?"
                     response = (
-                        f"I can answer questions about specific candidates "
-                        f"in the ranking — try naming a gene ({gene_list}),"
-                        f" a rank (*candidate 1*), or paste coordinates for"
-                        f" any variant (e.g. `chr10:123256215 T>G`).\n\n"
+                        f"I can answer questions about variants in the "
+                        f"ranking — use a gene name ({gene_list}) or "
+                        f"paste coordinates for any variant.\n\n"
                         f"**Some things you can ask:**\n"
-                        f"- Why is {ranked[0].gene} ranked first?\n"
-                        f"- Is the evidence for {ranked[1].gene} "
+                        f"- Why is the {top} variant ranked first?\n"
+                        f"- Is the {second} variant's evidence "
                         f"independent?\n"
-                        f"- What about chr5:179612 G>A? *(investigates a "
-                        f"new variant live)*"
+                        f"- What about chr3:38622160 G>A? *(investigates "
+                        f"a variant not in the shortlist)*"
                     )
+
+            # Strip citation verification line and show as expandable
+            cite_text = ""
+            for marker in ("\n\n*\u2713 ", "\n\n*\u26a0\ufe0f "):
+                idx = response.rfind(marker)
+                if idx >= 0:
+                    cite_text = response[idx + 2:].rstrip().rstrip("*")
+                    response = response[:idx]
+                    break
 
             st.markdown(response)
 
+            # Expandable citation details
+            if cite_text:
+                cited_ids = sorted(set(
+                    re.findall(r"\b([EACGQ]\d{3})\b", response)))
+                with st.expander(cite_text, expanded=False):
+                    rows = st.session_state.qa_rows
+                    for eid in cited_ids:
+                        row = next(
+                            (r for r in rows
+                             if r.get("evidence_id") == eid), None)
+                        if row:
+                            cat = row.get("category", "?")
+                            src = row.get("source", "?")
+                            interp = (row.get("interpretation") or
+                                      "")[:150]
+                            if len(row.get("interpretation", "")
+                                   ) > 150:
+                                interp += "\u2026"
+                            st.caption(
+                                f"**[{eid}]** {cat} \u00b7 {src}: "
+                                f"{interp}")
+                        else:
+                            st.caption(
+                                f"**[{eid}]** (from agent evidence)")
+
         st.session_state.chat_history.append(
-            {"role": "assistant", "content": response})
+            {"role": "assistant", "content": response,
+             "thinking": tool_log})
         st.rerun()
 
 
@@ -381,28 +821,137 @@ def render_qa() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_uploaded_analysis(vcf_file, pheno_file, team_name) -> None:
+    """Save uploaded files, run the pipeline, store results."""
+    import tempfile
+
+    # Save uploads to temp files
+    tmp_dir = Path(tempfile.mkdtemp())
+    vcf_path = tmp_dir / vcf_file.name
+    pheno_path = tmp_dir / pheno_file.name
+    vcf_path.write_bytes(vcf_file.getvalue())
+    pheno_path.write_bytes(pheno_file.getvalue())
+
+    with st.status(
+        "🧬 Running DNA Detective…", expanded=True,
+    ) as status:
+        def _prog(msg: str) -> None:
+            status.caption(msg)
+
+        try:
+            from main import run_analysis
+            results = run_analysis(
+                str(vcf_path), str(pheno_path),
+                team=team_name, progress=_prog)
+
+            status.update(
+                label="✅ Analysis complete",
+                state="complete", expanded=True)
+
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            status.update(
+                label="❌ Analysis failed",
+                state="error", expanded=True)
+            st.error(f"Pipeline error: {exc}")
+            import traceback
+            st.code(traceback.format_exc())
+            return
+
+    # Load the written report as dict
+    report_path = Path("outputs/dna_detective_report.json")
+    if report_path.exists():
+        with open(report_path) as f:
+            report_dict = json.load(f)
+    else:
+        st.error("Report was not written. Check the pipeline output.")
+        return
+
+    # Store everything in session state
+    st.session_state.report = report_dict
+    st.session_state.data_source = f"Uploaded: {vcf_file.name}"
+    st.session_state.qa_ranked = results["ranked"]
+    st.session_state.qa_rows = results["rows"]
+    st.session_state.qa_cand_map = results["cand_map"]
+    st.session_state.qa_tools = results["tools"]
+    st.session_state.qa_drops = results["drops"]
+    st.session_state.qa_ready = True
+    st.session_state.chat_history = []  # Reset chat for new data
+
+    # The disk report changed; the cached loader would serve the old one.
+    load_report.clear()
+    st.rerun()
+
+
 def main() -> None:
-    report = load_report()
+    st.title("🧬 DNA Detective")
+    st.caption("Rare-disease variant prioritisation with traceable evidence")
+
+    # ------------------------------------------------------------------
+    # Sidebar: file upload + settings
+    # ------------------------------------------------------------------
+    with st.sidebar:
+        st.subheader("📂 Analyse new data")
+        vcf_file = st.file_uploader(
+            "VCF file", type=["vcf"],
+            help="Patient variant call file (GRCh37)")
+        pheno_file = st.file_uploader(
+            "Phenopacket", type=["yml", "yaml", "json"],
+            help="Patient phenotype description")
+
+        can_run = vcf_file is not None and pheno_file is not None
+        team_name = st.text_input("Team name", value="Team 9")
+
+        if can_run:
+            if st.button("🧬 Run Analysis", type="primary",
+                         use_container_width=True):
+                _run_uploaded_analysis(
+                    vcf_file, pheno_file, team_name)
+
+        st.divider()
+
+        # Show data source
+        if "data_source" in st.session_state:
+            st.caption(
+                f"📊 Data: {st.session_state.data_source}")
+
+    # ------------------------------------------------------------------
+    # Load report (from session state or disk)
+    # ------------------------------------------------------------------
+    report = st.session_state.get("report")
+
     if report is None:
-        st.error(
-            f"`{REPORT_PATH}` not found. "
-            "Run `python3 main.py --team 'Team 9' --agent` first."
-        )
+        st.markdown(
+            "### Welcome\n\n"
+            "Upload a **VCF** file and **phenopacket** in the sidebar "
+            "to begin analysing a patient's genetic variants.")
+
+        # Option to load existing analysis if one exists on disk
+        if REPORT_PATH.exists():
+            st.divider()
+            if st.button("📂 Load previous analysis",
+                         help="Load results from the last CLI run"):
+                st.session_state.report = load_report()
+                st.session_state.data_source = "Previous analysis"
+                st.rerun()
         st.stop()
 
-    st.title("🧬 DNA Detective")
+    # Team label
     team = report.get("team", "?")
     team_label = team if team.lower().startswith("team") else f"Team {team}"
-    st.caption(
-        f"{team_label} · "
-        "Rare-disease variant prioritisation with traceable evidence"
-    )
+    st.caption(f"{team_label}")
 
-    tab_rank, tab_qa = st.tabs(
-        ["📊 Ranking & Evidence", "💬 Interactive Q&A"])
+    # ------------------------------------------------------------------
+    # Three tabs
+    # ------------------------------------------------------------------
+    tab_rank, tab_agent, tab_qa = st.tabs(
+        ["📊 Ranking & Evidence", "🤖 Agent Reasoning",
+         "💬 Interactive Q&A"])
 
     with tab_rank:
         render_ranking(report)
+
+    with tab_agent:
+        render_agent_thinking()
 
     with tab_qa:
         render_qa()
