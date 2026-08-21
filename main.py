@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Optional
 
 from src.agent.investigator import follow_up_examples, investigate_candidates, reason_over_evidence
 from src.pipeline.case_loader import load_case
@@ -68,7 +69,7 @@ def run_analysis(
     pheno_path: str,
     team: str = "Team 9",
     limit: int = 10,
-    agent_steps: int = 30,
+    agent_steps: Optional[int] = None,   # None -> derived from the shortlist
     progress=None,
 ):
     """Run the full pipeline and return all results for the UI.
@@ -114,13 +115,26 @@ def run_analysis(
     agent_mod.TOOLS["alphamissense"] = lambda cand: lookup_alphamissense(
         cand, cache_dir="outputs/agent_cache/alphamissense")
 
+    from dnadet.tools.gnomad import lookup_frequency as gnomad_lookup
+    agent_mod.TOOLS["gnomad"] = lambda cand: gnomad_lookup(
+        cand, cache_dir="outputs/agent_cache/gnomad")
+
     # --- Run agent -----------------------------------------------------------
     cand_dicts = [bridge.to_engine_dict(c) for c in candidates]
     ev_dicts = bridge.evidence_as_dicts(evidence)
     policy = agent_mod.DeterministicPolicy()
     transcript: list[str] = []
 
-    _prog(f"🤖 Running agent ({agent_steps} steps max)…")
+    # The policy fires each (candidate, tool) pair at most once and stops on
+    # its own when no gap is left, so the budget is a runaway guard, not a
+    # target. Deriving it from the shortlist means it can never truncate real
+    # work: a bigger case gets a bigger allowance automatically.
+    if agent_steps is None:
+        agent_steps = len(cand_dicts) * len(agent_mod.TOOLS) + 1
+        _prog(f"🤖 Running agent (budget {agent_steps} = "
+              f"{len(cand_dicts)} candidates x {len(agent_mod.TOOLS)} tools)…")
+    else:
+        _prog(f"🤖 Running agent ({agent_steps} steps max)…")
     final, new_rows = agent_mod.run(
         cand_dicts, ev_dicts, policy, agent_steps, transcript, 0.0)
 
@@ -203,7 +217,10 @@ def main() -> None:
     # --- agent mode ---
     parser.add_argument("--agent", action="store_true", help="Run the ReAct agent loop (agent decides which tools to call).")
     parser.add_argument("--agent-policy", choices=["deterministic", "llm"], default="deterministic")
-    parser.add_argument("--agent-steps", type=int, default=10)
+    parser.add_argument("--agent-steps", type=int, default=None,
+                        help="Cap on agent steps. Default: derived from "
+                             "candidates x tools, which cannot truncate "
+                             "the loop since it stops on its own.")
     parser.add_argument("--agent-pace", type=float, default=0.0, help="Seconds between agent steps (try 8 on Groq free tier).")
     args = parser.parse_args()
 
@@ -241,6 +258,8 @@ def main() -> None:
 
         from dnadet.tools.alphamissense import lookup_alphamissense
         agent_mod.TOOLS["alphamissense"] = lambda cand: lookup_alphamissense(cand, cache_dir="outputs/agent_cache/alphamissense")
+        from dnadet.tools.gnomad import lookup_frequency as gnomad_lookup
+        agent_mod.TOOLS["gnomad"] = lambda cand: gnomad_lookup(cand, cache_dir="outputs/agent_cache/gnomad")
 
         # Convert to engine format
         cand_dicts = [bridge.to_engine_dict(c) for c in candidates]
@@ -249,9 +268,14 @@ def main() -> None:
         policy = (agent_mod.DeterministicPolicy() if args.agent_policy == "deterministic"
                   else agent_mod.LLMPolicy(args.qa_backend))
         print(f"agent policy: {policy.name}")
+        steps = args.agent_steps
+        if steps is None:
+            steps = len(cand_dicts) * len(agent_mod.TOOLS) + 1
+            print(f"agent budget: {steps} "
+                  f"({len(cand_dicts)} candidates x {len(agent_mod.TOOLS)} tools)")
         transcript: list[str] = []
         final, new_rows = agent_mod.run(cand_dicts, ev_dicts, policy,
-                                        args.agent_steps, transcript, args.agent_pace)
+                                        steps, transcript, args.agent_pace)
 
         # Write transcript
         tx_dir = Path("docs/transcripts")
