@@ -61,6 +61,7 @@ class Evidence:
     raw_value: str = ""
     tool_or_data_version: str = ""
     url: str = ""
+    record_kind: str = ""   # retrieved | computed | gap; see dnadet.contract
     retrieved_at: str = ""
     interpretation: str = ""
     limitations: list[str] = field(default_factory=list)

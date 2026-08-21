@@ -29,6 +29,7 @@ def investigate(candidate: Candidate, case: Case) -> list[Evidence]:
         return bridge.to_model_evidence([{
             "candidate_id": candidate.candidate_id, "category": "clinvar",
             "source": "ClinVar (live) - lookup failed",
+            "record_kind": "gap",
             "assembly": case.assembly,
             "interpretation": (
                 f"ClinVar could not be reached ({type(exc).__name__}). This is a "

@@ -134,6 +134,7 @@ def lookup_alphamissense(
             effect_scores["ALPHA_MISSENSE"] = round(am_score, 4)
 
         return [Evidence(
+            record_kind="retrieved",
             evidence_id="",
             candidate_id=cid,
             category="alphamissense",
@@ -169,6 +170,7 @@ def lookup_alphamissense(
     if snapshot_score is not None:
         am_class = classify(float(snapshot_score))
         return [Evidence(
+            record_kind="computed",
             evidence_id="",
             candidate_id=cid,
             category="alphamissense",
@@ -201,6 +203,7 @@ def lookup_alphamissense(
     )
 
     return [Evidence(
+        record_kind="gap",
         evidence_id="",
         candidate_id=cid,
         category="alphamissense",

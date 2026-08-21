@@ -115,6 +115,7 @@ def to_model_evidence(rows: Iterable[Any], prefix: str) -> list[Evidence]:
             raw_value=d.get("raw_value", "") or "",
             tool_or_data_version=d.get("tool_or_data_version", "") or "",
             url=d.get("url", "") or "",
+            record_kind=d.get("record_kind", "") or "",
             retrieved_at=d.get("retrieved_at", "") or "",
             interpretation=d.get("interpretation", "") or "",
             limitations=list(d.get("limitations", [])),
@@ -131,6 +132,7 @@ def evidence_as_dicts(evidence: Iterable[Evidence]) -> list[dict[str, Any]]:
         "assembly": e.assembly, "transcript": e.transcript,
         "raw_field": e.raw_field, "raw_value": e.raw_value,
         "tool_or_data_version": e.tool_or_data_version, "url": e.url,
+        "record_kind": getattr(e, "record_kind", ""),
         "retrieved_at": e.retrieved_at, "interpretation": e.interpretation,
         "limitations": list(e.limitations),
     } for e in evidence]

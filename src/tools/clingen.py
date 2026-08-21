@@ -38,6 +38,7 @@ def investigate(candidate: Candidate, case: Case) -> list[Evidence]:
         return bridge.to_model_evidence([{
             "candidate_id": candidate.candidate_id, "category": "clingen",
             "source": "ClinGen ERepo - lookup failed", "record_or_accession": gene,
+            "record_kind": "gap",
             "assembly": case.assembly, "retrieved_at": stamp,
             "interpretation": note or "No parseable response from ClinGen. GAP, "
                                       "not a negative result.",
@@ -48,6 +49,7 @@ def investigate(candidate: Candidate, case: Case) -> list[Evidence]:
     return bridge.to_model_evidence([{
         "candidate_id": candidate.candidate_id, "category": "clingen",
         "source": "ClinGen Evidence Repository (ERepo)",
+        "record_kind": "retrieved",
         "record_or_accession": gene, "query": f"matchMode=exact&gene={gene}",
         "assembly": case.assembly, "raw_field": "variantInterpretations",
         "raw_value": f"{len(interps)} interpretation(s)",

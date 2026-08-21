@@ -88,6 +88,12 @@ class Evidence:
     raw_value: str = ""
     tool_or_data_version: str = ""
     url: str = ""
+    # What kind of thing this row records, decided by the builder that knows:
+    #   "retrieved" - an addressable external record; url should be set
+    #   "computed"  - a score or classification derived locally; no url exists
+    #   "gap"       - a lookup that returned nothing; not a citable record
+    # Empty means unclassified, and renders the way it always did.
+    record_kind: str = ""
     retrieved_at: str = ""              # ISO8601 Z
     interpretation: str = ""
     limitations: list[str] = field(default_factory=list)
