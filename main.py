@@ -63,6 +63,131 @@ def _make_clinvar_agent_tool(cache_path: str):
     return _tool
 
 
+def run_analysis(
+    vcf_path: str,
+    pheno_path: str,
+    team: str = "Team 9",
+    limit: int = 10,
+    agent_steps: int = 30,
+    progress=None,
+):
+    """Run the full pipeline and return all results for the UI.
+
+    This is the programmatic entry point used by app.py when users
+    upload their own files. The CLI entry point main() is unchanged.
+    """
+    _prog = progress or (lambda _: None)
+
+    _prog("📂 Loading case data…")
+    case = load_case(Path(vcf_path), Path(pheno_path))
+
+    _prog("🧬 Generating candidate shortlist…")
+    candidates = generate_candidate_shortlist(case, limit=limit)
+    evidence = list(shortlist_evidence())
+    try:
+        drops = list(shortlist_drops())
+    except Exception:  # noqa: BLE001 - drops are a nicety, not a requirement
+        drops = []
+
+    _prog(f"📋 {len(candidates)} candidates, {len(evidence)} evidence rows")
+
+    # --- Register agent tools ------------------------------------------------
+    from dnadet import agent as agent_mod
+    from src import bridge
+
+    agent_mod.TOOLS["clinvar"] = _make_clinvar_agent_tool(
+        "outputs/agent_cache")
+
+    from dnadet.tools.vep import annotate_candidate as vep_annotate
+    agent_mod.TOOLS["vep"] = lambda cand: vep_annotate(
+        cand, cache_dir="outputs/agent_cache/vep")
+
+    from dnadet.tools.pubmed import search_candidate as pubmed_search
+    agent_mod.TOOLS["pubmed"] = lambda cand: pubmed_search(
+        cand, cache_dir="outputs/agent_cache/pubmed")
+
+    from dnadet.tools.spliceai import predict_splice
+    agent_mod.TOOLS["splice"] = lambda cand: predict_splice(
+        cand, cache_dir="outputs/agent_cache/spliceai")
+
+    from dnadet.tools.alphamissense import lookup_alphamissense
+    agent_mod.TOOLS["alphamissense"] = lambda cand: lookup_alphamissense(
+        cand, cache_dir="outputs/agent_cache/alphamissense")
+
+    # --- Run agent -----------------------------------------------------------
+    cand_dicts = [bridge.to_engine_dict(c) for c in candidates]
+    ev_dicts = bridge.evidence_as_dicts(evidence)
+    policy = agent_mod.DeterministicPolicy()
+    transcript: list[str] = []
+
+    _prog(f"🤖 Running agent ({agent_steps} steps max)…")
+    final, new_rows = agent_mod.run(
+        cand_dicts, ev_dicts, policy, agent_steps, transcript, 0.0)
+
+    # --- Build ranked candidates ---------------------------------------------
+    _prog("📊 Building ranking…")
+    cand_map = {c["candidate_id"]: c for c in cand_dicts}
+    max_str = max((a.strength for a in final), default=1) or 1
+    ranked_candidates = []
+    for i, a in enumerate(final, 1):
+        rec = dict(cand_map[a.candidate_id])
+        rec["reason_for_rank"] = a.reason
+        rec["confidence"] = round(a.strength / max_str, 2) if a.strength > 0 else 0.0
+        rec["conflicts"] = a.conflicts
+        ranked_candidates.append(bridge.to_model_candidate(rec, rank=i))
+
+    agent_ev = bridge.to_model_evidence(new_rows, prefix="A")
+    evidence.extend(agent_ev)
+
+    # --- Build report --------------------------------------------------------
+    agent_tool_names = [
+        "ClinVar", "VEP", "PubMed", "SpliceAI",
+        "AlphaMissense", "gnomAD",
+    ]
+    report = build_report(
+        case=case, candidates=ranked_candidates, evidence=evidence,
+        tools=agent_tool_names, team=team, limitations=LIMITATIONS)
+
+    qa_kwargs = {"cands": cand_map, "tools": agent_mod.TOOLS}
+    report.follow_up_examples = follow_up_examples(
+        ranked_candidates, evidence, policy="template",
+        backend="", **qa_kwargs)
+
+    # --- Write report and transcript to disk (for persistence) ---------------
+    output_path = Path("outputs/dna_detective_report.json")
+    write_report(report, output_path)
+
+    tx_dir = Path("docs/transcripts")
+    tx_dir.mkdir(parents=True, exist_ok=True)
+    from dnadet.agent import write_transcript, assess
+    write_transcript(
+        str(tx_dir / "agent_transcript.md"), transcript, final)
+
+    # The report is a dataclass; the UI wants the serialised dict, so read
+    # back exactly what was written rather than reimplementing the mapping.
+    import json as _json
+    with open(output_path, encoding="utf-8") as _f:
+        report_dict = _json.load(_f)
+
+    # --- Build Q&A data ------------------------------------------------------
+    all_rows = bridge.evidence_as_dicts(evidence)
+    ranked_assessments = sorted(
+        [assess(c, all_rows) for c in cand_dicts],
+        key=lambda a: a.sort_key)
+
+    _prog("✅ Analysis complete")
+
+    return {
+        "report": report_dict,
+        "ranked": ranked_assessments,
+        "rows": all_rows,
+        "cand_map": cand_map,
+        "tools": agent_mod.TOOLS,
+        "transcript": transcript,
+        "drops": drops,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vcf", type=Path, default=Path("data/Pfeiffer.vcf"))
@@ -143,6 +268,7 @@ def main() -> None:
             rec = dict(cand_map[a.candidate_id])
             rec["reason_for_rank"] = a.reason
             rec["confidence"] = round(a.strength / max_str, 2) if a.strength > 0 else 0.0
+            rec["conflicts"] = a.conflicts
             ranked.append(bridge.to_model_candidate(rec, rank=i))
 
         # Merge agent-produced evidence into the offline set
@@ -152,6 +278,11 @@ def main() -> None:
 
         # Q&A will use the same live tools to fill gaps and investigate ad-hoc variants
         qa_kwargs: dict = {"cands": cand_map, "tools": agent_mod.TOOLS}
+
+        # The registry only knows the two src/ adapters; the agent path calls
+        # the engine tools directly, so report what actually ran.
+        tool_names = ["ClinVar", "VEP", "PubMed", "SpliceAI",
+                      "AlphaMissense", "gnomAD"]
 
     # ------------------------------------------------------------------ #
     # PATH B: linear pipeline (original behaviour)                        #
@@ -165,11 +296,12 @@ def main() -> None:
 
         ranked = reason_over_evidence(candidates, evidence)
         qa_kwargs = {}
+        tool_names = registry.names()
 
     # ------------------------------------------------------------------ #
     # Common: build and write the report                                  #
     # ------------------------------------------------------------------ #
-    report = build_report(case=case, candidates=ranked, evidence=evidence, tools=registry.names(), team=args.team, limitations=LIMITATIONS)
+    report = build_report(case=case, candidates=ranked, evidence=evidence, tools=tool_names, team=args.team, limitations=LIMITATIONS)
     report.follow_up_examples = follow_up_examples(ranked, evidence, policy=args.qa_policy, backend=args.qa_backend, **qa_kwargs)
     write_report(report, args.output)
 
