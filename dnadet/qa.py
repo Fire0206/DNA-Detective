@@ -65,6 +65,10 @@ GAP_TOOLS: dict[str, str] = {
     "no clinical interpretation": "clinvar",
     "consequence unknown": "vep",
     "no literature": "pubmed",
+    # PM2 is assessable live now that the gnomAD lookup is implemented; without
+    # these two entries the Q&A layer would leave a frequency gap it can close.
+    "no population frequency": "gnomad",
+    "absence confirmed only": "gnomad",
 }
 
 
@@ -207,7 +211,9 @@ def investigate_adhoc(
     new_rows: list[dict] = []
     # VEP first — it fills cand["consequence"] and cand["gene"],
     # then ClinVar and PubMed can use that information.
-    for tool_name in ("vep", "clinvar", "pubmed"):
+    # VEP first (it supplies the gene the others search on), then the three
+    # evidence families an ad-hoc variant can actually be assessed from.
+    for tool_name in ("vep", "clinvar", "gnomad", "pubmed"):
         if tool_name not in tools:
             continue
         gene_label = cand.get("gene") or cid
@@ -307,11 +313,28 @@ def _explain(v: "Verdict", gene: str) -> str:
 
     if f == "population":
         if s == "supports":
-            return ("Not seen in ~140,000 healthy individuals — "
-                    "consistent with a rare-disease variant")
+            # The cohort size belongs to whichever source answered, so take the
+            # claim from the verdict rather than asserting a fixed number.
+            return ("Not seen in population databases — consistent with a "
+                    "rare-disease variant"
+                    + (", confirmed live" if "confirmed live" in v.detail else ""))
         if s == "conflicts":
-            return ("Observed in healthy populations — less likely "
+            m = re.search(r"at ([\d.]+)%", v.detail)
+            return (f"Observed in healthy populations at {m.group(1)}% — "
+                    "too common to cause a rare disorder" if m else
+                    "Observed in healthy populations — less likely "
                     "to be disease-causing")
+        if s == "unusable":
+            # A frequency WAS returned; it just does not support PM2. Saying
+            # "no data" here would hide a real measurement.
+            m = re.search(r"at ([\d.eE+-]+)%", v.detail)
+            if m:
+                try:
+                    pct = f"{float(m.group(1)):.4g}"
+                except ValueError:
+                    pct = m.group(1)
+                return (f"Present in population databases at {pct}% — "
+                        "rare, but PM2 requires absence")
         return "No population frequency data"
 
     if f == "computational":
@@ -340,6 +363,18 @@ def _explain(v: "Verdict", gene: str) -> str:
                         "this specific variant")
             return (f"{count} publication(s) link {gene} to "
                     "the candidate disease")
+        if "not searched" in v.detail.lower():
+            # Distinguish a search that returned nothing from one that never
+            # ran; only the first is a finding.
+            return "Literature not searched — no gene symbol available"
+        if s == "unusable":
+            # Publications exist for the gene but none are specific to this
+            # variant or its candidate disease. Saying "none found" here would
+            # understate the literature and misstate what was checked.
+            m = re.search(r"(\d+) publication", v.detail)
+            if m:
+                return (f"{m.group(1)} publication(s) discuss {gene}, but none "
+                        "are specific to this variant or its candidate disease")
         return "No relevant publications found"
 
     return v.detail
@@ -828,6 +863,65 @@ def llm_answer(question: str, context: dict, backend: str, model: str) -> Option
 # --------------------------------------------------------------------------- #
 
 
+_ACRONYMS = {"MVP", "REVEL", "CADD", "SIFT", "MPC", "VEST", "GERP", "PHYLOP"}
+
+
+def _pretty_source(source: str) -> str:
+    """ALPHA_MISSENSE -> AlphaMissense, SPLICE_AI -> SpliceAI, REVEL -> REVEL.
+
+    Purely structural: an ALL_CAPS underscore token is a predictor name from
+    the Exomiser bundle, so it is title-cased and joined. Anything already
+    written for humans is left exactly as it is.
+    """
+    if not (source.isupper() and source.replace("_", "").isalnum()):
+        return source
+    if source in _ACRONYMS:
+        return source
+    parts = source.split("_")
+    if parts[-1] == "AI":                      # SPLICE_AI -> SpliceAI
+        return "".join(w.capitalize() for w in parts[:-1]) + "AI"
+    return "".join(w.capitalize() for w in parts)
+
+
+def _gap_reason(source: str, searchable: bool = False) -> str:
+    """Why a lookup produced nothing, read off the source label.
+
+    Tools mark their own failures in the source string ("PubMed - skipped",
+    "SpliceAI - UNREACHABLE", "... (NOT IMPLEMENTED)"), so the explanation is
+    already in the data rather than in a table this file has to maintain.
+    """
+    low = source.lower()
+    if "not implemented" in low:
+        return "not queried - live lookup not implemented"
+    if "skipped" in low:
+        return "not searched - no gene symbol available"
+    if "unreachable" in low or "failed" in low:
+        return "unreachable - the service did not respond"
+    if "unavailable" in low:
+        return "unavailable for this variant"
+    if searchable:
+        # The row carries a link, so the lookup ran and the reader can open the
+        # same search: it returned nothing rather than failing.
+        return "no record found"
+    return "not retrieved"
+
+
+def _measurement(row: dict) -> str:
+    """The value a computed row reports, short enough to sit inside prose.
+
+    Scores render to 2 decimals ("0.9918" -> "0.99"); anything else that is not
+    a bare JSON blob is passed through, and blobs are dropped so the reader is
+    not shown raw payload.
+    """
+    raw = str(row.get("raw_value", "")).strip()
+    if not raw or raw.startswith(("{", "[")):
+        return ""
+    try:
+        return f"{float(raw):.2f}"
+    except ValueError:
+        return raw if len(raw) <= 40 else ""
+
+
 def _humanise_citations(text: str, rows: list[dict]) -> str:
     """Turn raw evidence IDs into clickable links with readable labels.
 
@@ -838,8 +932,9 @@ def _humanise_citations(text: str, rows: list[dict]) -> str:
     if not rows:
         return text
 
-    # Build lookup: evidence_id -> (tag, url)
-    lookup: dict[str, tuple[str, str]] = {}
+    # Build lookup: evidence_id -> (tag, url, kind, measurement)
+    lookup: dict[str, tuple] = {}
+    lookup_src: dict[str, str] = {}
     for r in rows:
         eid = r.get("evidence_id", "")
         if not eid:
@@ -863,24 +958,50 @@ def _humanise_citations(text: str, rows: list[dict]) -> str:
             tag = "gnomAD"
         elif "frequency" in cat:
             tag = "Population"
+        elif "clingen" in cat.lower():
+            tag = "ACMG/AMP"
+        elif source:
+            # Exomiser names its predictors in the data itself (ALPHA_MISSENSE,
+            # REVEL, SPLICE_AI, and whatever a later bundle adds), so prettify
+            # the token rather than matching against a fixed list that a new
+            # dataset would silently fall through.
+            tag = _pretty_source(source)
         elif cat:
             tag = cat
         else:
             tag = "evidence"
-        lookup[eid] = (tag, url)
+        lookup[eid] = (tag, url, r.get("record_kind", ""),
+                       _measurement(r))
+        lookup_src[eid] = source
 
     # Normalise "[E002]" to "E002" so the next step cannot nest brackets.
     text = re.sub(r"\[([EACGQ]\d{3})\]", r"\1", text)
 
     def _replace(m: "re.Match") -> str:
+        """Render one citation as `<what it says> (<evidence id>)`.
+
+        The id sits in the same place for every row, so `(E004)` always means
+        "this claim traces to row E004 of the log". Whether the label is a link
+        carries the other distinction on its own: a link means an external
+        record exists to open, no link means the value was computed here and
+        has no page to point at. Encoding both facts in the id's position made
+        the two kinds of row look like different sorts of reference.
+        """
         eid = m.group(1)
         if eid not in lookup:
             return eid
-        tag, url = lookup[eid]
-        label = f"{eid}: {tag}"
+        tag, url, kind, measurement = lookup[eid]
+
+        if kind == "gap":
+            what = f"{tag} {_gap_reason(lookup_src.get(eid, ''), bool(url))}"
+        elif kind == "computed":
+            what = f"{tag} {measurement}" if measurement else tag
+        else:
+            what = tag
+
         if url:
-            return f"[{label}]({url})"
-        return f"({label})"
+            what = f"[{what}]({url})"
+        return f"{what} ({eid})"
 
     return CITE_RE.sub(_replace, text)
 
