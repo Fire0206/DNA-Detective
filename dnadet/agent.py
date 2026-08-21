@@ -59,7 +59,7 @@ from .net import JSON_HEADERS, ssl_context
 
 # A "family" is an INDEPENDENT line of argument. Two rows in the same family are
 # one argument stated twice, not two arguments.
-FAMILIES = ("clinical", "phenotype", "population", "computational", "consequence")
+FAMILIES = ("clinical", "phenotype", "population", "computational", "consequence", "literature")
 
 CATEGORY_TO_FAMILY = {
     "clinvar": "clinical",
@@ -68,7 +68,10 @@ CATEGORY_TO_FAMILY = {
     "gnomad": "population",
     "effect": "computational",
     "vep": "consequence",
-}
+    "pubmed": "literature",
+    "spliceai": "computational",
+    "alphamissense": "computational",
+    }
 
 
 def now_iso() -> str:
@@ -96,6 +99,8 @@ W_CLINICAL_SINGLE = 1    # 1-star, one submitter - an opinion, not a consensus
 W_PHENOTYPE_MATCH = 2    # patient's own terms in the gene's disease annotation
 W_POPULATION_ABSENT = 1  # PM2 support
 W_COMPUTATIONAL = 1      # in silico only, shared training data
+W_LITERATURE_VARIANT = 2 # published evidence about THIS specific variant
+W_LITERATURE_GENE = 1    # gene-disease link in literature (not variant-specific)
 
 
 @dataclass
@@ -275,6 +280,58 @@ def assess(cand: dict, rows: list[dict]) -> Assessment:
                 "Consequence is taken from the ClinVar record itself, so it is not "
                 "independent of the ClinVar classification.")
 
+    # --- literature ---------------------------------------------------------
+    lit_ids = [r["evidence_id"] for r in by_family.get("literature", [])]
+    lit_rows = by_family.get("literature", [])
+    if lit_rows:
+        raw = (lit_rows[0].get("raw_value") or "").split(" | ")
+        try:
+            variant_pubs = int(raw[0]) if raw else 0
+        except ValueError:
+            variant_pubs = 0
+        try:
+            gene_disease_pubs = int(raw[1]) if len(raw) > 1 else 0
+        except ValueError:
+            gene_disease_pubs = 0
+        try:
+            gene_path_pubs = int(raw[2]) if len(raw) > 2 else 0
+        except ValueError:
+            gene_path_pubs = 0
+
+        if variant_pubs > 0:
+            verdicts.append(Verdict("literature", "supports",
+                                    f"{variant_pubs} publication(s) directly reference "
+                                    "this variant — published, independent evidence.",
+                                    lit_ids, derived_from="pubmed",
+                                    weight=W_LITERATURE_VARIANT))
+        elif gene_disease_pubs > 5:
+            verdicts.append(Verdict("literature", "supports",
+                                    f"Gene-disease link well-documented "
+                                    f"({gene_disease_pubs} publications). Not "
+                                    "variant-specific.", lit_ids,
+                                    derived_from="pubmed",
+                                    weight=W_LITERATURE_GENE))
+        elif gene_disease_pubs > 0:
+            verdicts.append(Verdict("literature", "supports",
+                                    f"Gene-disease link documented "
+                                    f"({gene_disease_pubs} publication(s)). "
+                                    "Limited — not a widely studied association.",
+                                    lit_ids, derived_from="pubmed",
+                                    weight=W_LITERATURE_GENE))
+        elif gene_path_pubs > 0:
+            verdicts.append(Verdict("literature", "unusable",
+                                    f"{gene_path_pubs} publication(s) on pathogenic "
+                                    f"variants in this gene, but none link it to the "
+                                    "candidate disease.", lit_ids))
+        else:
+            verdicts.append(Verdict("literature", "absent",
+                                    "No relevant publications found.", lit_ids))
+            gaps.append("no literature support for gene-disease link")
+    else:
+        verdicts.append(Verdict("literature", "absent",
+                                "No literature search performed.", []))
+        gaps.append("no literature evidence")
+
     # --- independence -------------------------------------------------------
     supporting = [v for v in verdicts if v.stance == "supports"]
     origins = {v.derived_from for v in supporting if v.derived_from}
@@ -387,7 +444,7 @@ class DeterministicPolicy:
         #    at the ranking boundary with no clinical interpretation should be
         #    investigated first — ClinVar can move it more than any other tool.
         if "clinvar" in TOOLS:
-            for a in ranked[:3]:
+            for a in ranked:
                 if (any("no clinical interpretation" in g for g in a.gaps)
                         and (a.candidate_id, "clinvar") not in done):
                     return Action(
@@ -421,7 +478,19 @@ class DeterministicPolicy:
                               f"{a.gene} is a splice-region variant - a splice model "
                               "is applicable here and nowhere else in the shortlist.")
 
+        # 4. Literature - independent of ClinVar; most useful when clinical
+        #    support is weak or absent for a top candidate.
+        if "pubmed" in TOOLS:
+            for a in ranked:
+                if (any("no literature" in g for g in a.gaps)
+                        and (a.candidate_id, "pubmed") not in done):
+                    return Action(
+                        "investigate", a.candidate_id, "pubmed",
+                        f"{a.gene} has no literature evidence — PubMed can "
+                        "independently confirm the gene-disease link.")
+
         return Action("stop", reason=stop_reason(ranked))
+    
 
 
 BACKENDS = {

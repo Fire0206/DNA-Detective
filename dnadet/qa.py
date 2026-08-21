@@ -64,6 +64,7 @@ ORDINALS = {
 GAP_TOOLS: dict[str, str] = {
     "no clinical interpretation": "clinvar",
     "consequence unknown": "vep",
+    "no literature": "pubmed",
 }
 
 
