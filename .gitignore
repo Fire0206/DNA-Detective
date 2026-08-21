@@ -5,3 +5,4 @@ __pycache__/
 venv/
 .env
 outputs/
+docs/transcripts/agent_transcript.md

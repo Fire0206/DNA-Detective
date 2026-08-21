@@ -80,9 +80,6 @@ def main() -> None:
     parser.add_argument("--agent-policy", choices=["deterministic", "llm"], default="deterministic")
     parser.add_argument("--agent-steps", type=int, default=10)
     parser.add_argument("--agent-pace", type=float, default=0.0, help="Seconds between agent steps (try 8 on Groq free tier).")
-    parser.add_argument("--transcript", type=Path, default=Path("outputs/agent_transcript.md"),
-                        help="Where to write the agent transcript. Defaults under outputs/ because it is "
-                             "a generated artifact; point it at docs/transcripts/ to keep a run as a deliverable.")
     args = parser.parse_args()
 
     case = load_case(args.vcf, args.phenopacket)
@@ -111,6 +108,15 @@ def main() -> None:
         from dnadet.tools.vep import annotate_candidate as vep_annotate
         agent_mod.TOOLS["vep"] = lambda cand: vep_annotate(cand, cache_dir="outputs/agent_cache/vep")
 
+        from dnadet.tools.pubmed import search_candidate as pubmed_search
+        agent_mod.TOOLS["pubmed"] = lambda cand: pubmed_search(cand, cache_dir="outputs/agent_cache/pubmed")
+
+        from dnadet.tools.spliceai import predict_splice
+        agent_mod.TOOLS["splice"] = lambda cand: predict_splice(cand, cache_dir="outputs/agent_cache/spliceai")
+
+        from dnadet.tools.alphamissense import lookup_alphamissense
+        agent_mod.TOOLS["alphamissense"] = lambda cand: lookup_alphamissense(cand, cache_dir="outputs/agent_cache/alphamissense")
+
         # Convert to engine format
         cand_dicts = [bridge.to_engine_dict(c) for c in candidates]
         ev_dicts = bridge.evidence_as_dicts(evidence)
@@ -122,12 +128,12 @@ def main() -> None:
         final, new_rows = agent_mod.run(cand_dicts, ev_dicts, policy,
                                         args.agent_steps, transcript, args.agent_pace)
 
-        # Write transcript. This is a generated artifact, so it defaults under
-        # outputs/ (gitignored) rather than into a tracked docs/ path - otherwise
-        # every agent run leaves the tree dirty with a re-timestamped file.
-        args.transcript.parent.mkdir(parents=True, exist_ok=True)
-        agent_mod.write_transcript(str(args.transcript), transcript, final)
-        print(f"agent transcript -> {args.transcript}")
+        # Write transcript
+        tx_dir = Path("docs/transcripts")
+        tx_dir.mkdir(parents=True, exist_ok=True)
+        tx_path = str(tx_dir / "agent_transcript.md")
+        agent_mod.write_transcript(tx_path, transcript, final)
+        print(f"agent transcript -> {tx_path}")
 
         # Convert assessments back to model candidates
         cand_map = {c["candidate_id"]: c for c in cand_dicts}
