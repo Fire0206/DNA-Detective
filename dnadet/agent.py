@@ -217,12 +217,19 @@ def assess(cand: dict, rows: list[dict]) -> Assessment:
     absent_rows = [r for r in by_family["population"]
                    if "Not observed" in (r.get("interpretation") or "")]
     if af is None and absent_rows:
+        # A live gnomAD row confirms the absence against current data; without
+        # one, PM2 rests on the offline snapshot alone and must say so.
+        live_absent = any("live" in (r.get("source") or "").lower()
+                          for r in absent_rows)
         verdicts.append(Verdict("population", "supports",
                                 "Absent from population databases - consistent with "
-                                "PM2 for a rare dominant disorder.", pop_ids,
+                                "PM2 for a rare dominant disorder"
+                                + (", confirmed live." if live_absent
+                                   else " (snapshot only)."), pop_ids,
                                 derived_from="gnomad",
                                 weight=W_POPULATION_ABSENT))
-        gaps.append("absence confirmed only against the 2406 snapshot")
+        if not live_absent:
+            gaps.append("absence confirmed only against the 2406 snapshot")
     elif af is not None:
         verdicts.append(Verdict("population", "conflicts" if af > 2.0 else "unusable",
                                 f"Observed in controls at {af}% - PM2 cannot be "
@@ -283,7 +290,16 @@ def assess(cand: dict, rows: list[dict]) -> Assessment:
     # --- literature ---------------------------------------------------------
     lit_ids = [r["evidence_id"] for r in by_family.get("literature", [])]
     lit_rows = by_family.get("literature", [])
-    if lit_rows:
+    if lit_rows and all(r.get("record_kind") == "gap" for r in lit_rows):
+        # The search never ran - PubMed needs a gene symbol and had none. Its
+        # row carries no counts, which would otherwise parse to three zeros and
+        # become "no publications found": a negative finding nobody checked.
+        verdicts.append(Verdict("literature", "unusable",
+                                "Literature not searched - no gene symbol was "
+                                "available to search on. This is a gap, not an "
+                                "absence of publications.", lit_ids))
+        gaps.append("literature never searched (no gene symbol)")
+    elif lit_rows:
         raw = (lit_rows[0].get("raw_value") or "").split(" | ")
         try:
             variant_pubs = int(raw[0]) if raw else 0
@@ -395,6 +411,7 @@ def tool_not_implemented(name: str, what: str, blocking: str) -> ToolFn:
 
     def _fn(cand: dict) -> list[Evidence]:
         return [Evidence(
+            record_kind="gap",
             evidence_id="",
             candidate_id=cand["candidate_id"],
             category=name,
