@@ -41,6 +41,14 @@ from ..contract import Evidence
 from ..net import ssl_context
 
 SPLICEAI_API = "https://spliceailookup-api.broadinstitute.org/spliceai/"
+# The API answers in JSON; the Broad hosts a browser UI over the same lookup.
+SPLICEAI_UI = ("https://spliceailookup.broadinstitute.org/"
+               "#variant={chrom}-{pos}-{ref}-{alt}&hg=37")
+
+
+def spliceai_ui_url(chrom: str, pos: int, ref: str, alt: str) -> str:
+    """Browser view of the same SpliceAI lookup, for a human reader."""
+    return SPLICEAI_UI.format(chrom=chrom, pos=pos, ref=ref, alt=alt)
 
 MIN_INTERVAL = 0.5
 _last_call = [0.0]
@@ -201,6 +209,7 @@ def _vep_fallback(
         parts.append("No VEP annotation available for fallback.")
 
     return [Evidence(
+        record_kind="gap",
         evidence_id="",
         candidate_id=cid,
         category="spliceai",
@@ -211,7 +220,7 @@ def _vep_fallback(
         raw_value=consequence or "unavailable",
         tool_or_data_version=(
             f"SpliceAI API unreachable; VEP cache from {vep_stamp or '?'}"),
-        url=spliceai_url or "",
+        url=spliceai_ui_url(chrom, pos, ref, alt),
         retrieved_at=stamp or now_iso(),
         interpretation=" ".join(parts),
         limitations=[
@@ -254,6 +263,7 @@ def predict_splice(
     # --- no scores -----------------------------------------------------------
     if not scores:
         return [Evidence(
+            record_kind="retrieved",
             evidence_id="",
             candidate_id=cid,
             category="spliceai",
@@ -261,7 +271,7 @@ def predict_splice(
             query=f"{chrom}:{pos} {ref}>{alt}",
             assembly="GRCh37",
             tool_or_data_version=f"SpliceAI lookup, retrieved {stamp}",
-            retrieved_at=stamp, url=url,
+            retrieved_at=stamp, url=spliceai_ui_url(chrom, pos, ref, alt),
             interpretation=(
                 f"SpliceAI returned no predictions for {gene} at "
                 f"{chrom}:{pos}. The variant may be outside the model's "
@@ -320,6 +330,7 @@ def predict_splice(
         "carries more weight than among predictors sharing training data.")
 
     rows: list[Evidence] = [Evidence(
+        record_kind="retrieved",
         evidence_id="",
         candidate_id=cid,
         category="spliceai",
@@ -332,7 +343,7 @@ def predict_splice(
         tool_or_data_version=(
             f"SpliceAI lookup API (broadinstitute.org), "
             f"retrieved {stamp}"),
-        url=url,
+        url=spliceai_ui_url(chrom, pos, ref, alt),
         retrieved_at=stamp,
         interpretation=" ".join(parts),
         limitations=[
@@ -346,6 +357,7 @@ def predict_splice(
     # Gene symbol mismatch
     if gene_spliceai and gene != "?" and gene_spliceai != gene:
         rows.append(Evidence(
+            record_kind="computed",
             evidence_id="",
             candidate_id=cid,
             category="spliceai",
@@ -354,7 +366,7 @@ def predict_splice(
             raw_field="gene_symbol",
             raw_value=f"Exomiser: {gene}, SpliceAI: {gene_spliceai}",
             tool_or_data_version=f"SpliceAI lookup, retrieved {stamp}",
-            url=url, retrieved_at=stamp,
+            url=spliceai_ui_url(chrom, pos, ref, alt), retrieved_at=stamp,
             interpretation=(
                 f"Gene symbol mismatch: Exomiser says {gene}, SpliceAI "
                 f"says {gene_spliceai}."),

@@ -57,6 +57,10 @@ from ..net import ssl_context
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CLINVAR_UI = "https://www.ncbi.nlm.nih.gov/clinvar/variation/{}/"
+# The esearch endpoint answers in JSON. An evidence row is read by a person, so
+# it cites the equivalent ClinVar web search instead - same query, and for a
+# no-hit search the reader sees "No items found", which verifies the negative.
+CLINVAR_SEARCH_UI = "https://www.ncbi.nlm.nih.gov/clinvar/?term={}"
 CLINGEN_VALIDITY = "https://search.clinicalgenome.org/kb/gene-validity"
 CLINGEN_EREPO = "https://erepo.clinicalgenome.org/evrepo/api/classifications"
 
@@ -444,11 +448,14 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
                 print(f"    NEW since 2406: ClinVar {ids}")
             else:
                 log.add(
+                    record_kind="gap",
                     candidate_id=cid, category="clinvar", source="ClinVar (live)",
                     query=f"{cand['chrom']}[chr] AND {cand['pos']}[chrpos37]",
                     raw_field="esearchresult.idlist", raw_value="[]",
                     tool_or_data_version=f"NCBI E-utilities, retrieved {stamp or 'n/a'}",
-                    url=url, retrieved_at=stamp,
+                    url=CLINVAR_SEARCH_UI.format(urllib.parse.quote(
+                        f"{cand['chrom']}[chr] AND {cand['pos']}[chrpos37]")),
+                    retrieved_at=stamp,
                     interpretation=(
                         "No ClinVar record at this position, live, today. Absent from "
                         "the archive is NOT evidence of benignity - it means no lab "
@@ -504,10 +511,14 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
 
         if chosen is None:
             log.add(
+                record_kind="gap",
                 candidate_id=cid, category="clinvar", source="ClinVar (live)",
                 record_or_accession=", ".join(try_ids),
                 query=f"esummary db=clinvar id={','.join(try_ids)}",
                 tool_or_data_version="NCBI E-utilities", retrieved_at=now_iso(),
+                # The records are real and inspectable - they just describe a
+                # different allele. Link the first so the reader can confirm that.
+                url=(CLINVAR_UI.format(rejected[0]) if rejected else ""),
                 interpretation=(
                     (f"{len(rejected)} ClinVar record(s) sit at this position "
                      f"({', '.join(rejected)}) but every one describes a DIFFERENT "
@@ -532,6 +543,14 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
         elif not locus_verified:
             print("    [locus unverified - no GRCh37 coordinate in record]")
 
+        # Hand the gene symbol back to the candidate. On the ad-hoc path VEP
+        # normally supplies it, but Ensembl fails often enough that PubMed would
+        # otherwise be left with no gene to search on. ClinVar already parsed it.
+        if not cand.get("gene"):
+            _genes = [g for g in (info.get("genes") or []) if g]
+            if _genes:
+                cand["gene"] = _genes[0]
+
         live_label = info["classification"]
         stars = info["review_status"]
         snap_tier, live_tier = tier_of(snap_label or ""), tier_of(live_label)
@@ -540,6 +559,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
                    and normalise_label(live_label) != normalise_label(snap_label))
 
         log.add(
+            record_kind="retrieved",
             candidate_id=cid, category="clinvar", source="ClinVar (live)",
             record_or_accession=info["accession"] or f"VariationID {variation_id}",
             query=f"esummary db=clinvar id={variation_id}",
@@ -576,6 +596,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
         g37 = info.get("grch37") or {}
         if not locus_verified:
             log.add(
+                record_kind="retrieved",
                 candidate_id=cid, category="clinvar",
                 source="ClinVar (live) - locus check",
                 record_or_accession=info["accession"],
@@ -597,6 +618,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
         else:
             same = True  # only reached when same_locus() already returned True
             log.add(
+                record_kind="retrieved",
                 candidate_id=cid, category="clinvar",
                 source="ClinVar (live) - locus check",
                 record_or_accession=info["accession"],
@@ -634,6 +656,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
                 and snap_p_norm not in
                 strip_hgvs_p(live_title + " " + info.get("protein_change", ""))):
             log.add(
+                record_kind="retrieved",
                 candidate_id=cid, category="clinvar",
                 source="ClinVar (live) - HGVS check",
                 record_or_accession=info["accession"],
@@ -658,6 +681,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
             drift.append({"candidate_id": cid, "gene": gene,
                           "snapshot": snap_label, "live": live_label})
             log.add(
+                record_kind="retrieved",
                 candidate_id=cid, category="clinvar", source="ClinVar drift check",
                 record_or_accession=info["accession"] or str(variation_id),
                 raw_field="snapshot 2406 vs live",
@@ -680,6 +704,7 @@ def process(candidates: list[dict], outdir: str, replay: bool, limit: Optional[i
             if isinstance(gbody, dict):
                 interps = gbody.get("variantInterpretations") or []
                 log.add(
+                    record_kind="retrieved",
                     candidate_id=cid, category="clingen",
                     source="ClinGen Evidence Repository (ERepo)",
                     record_or_accession=gene,

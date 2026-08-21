@@ -39,6 +39,15 @@ from ..net import ssl_context
 
 # GRCh37 — NOT the default host.
 VEP_HOST = "https://grch37.rest.ensembl.org"
+# The REST host answers in JSON. Evidence rows cite the Ensembl browser view of
+# the same GRCh37 locus, which a reader can actually inspect.
+ENSEMBL_UI = ("https://grch37.ensembl.org/Homo_sapiens/Location/View"
+              "?r={chrom}:{start}-{end}")
+
+
+def ensembl_locus_url(chrom: str, pos: int) -> str:
+    """Browser view of a GRCh37 locus, for a human following a citation."""
+    return ENSEMBL_UI.format(chrom=chrom, start=pos, end=pos)
 
 # Ensembl REST allows 15 req/s unauthenticated. Be conservative.
 MIN_INTERVAL = 0.25
@@ -250,6 +259,7 @@ def annotate_candidate(
     # --- fetch failed ---------------------------------------------------------
     if body is None:
         return [Evidence(
+            record_kind="gap",
             evidence_id="",
             candidate_id=cid,
             category="vep",
@@ -258,7 +268,7 @@ def annotate_candidate(
             assembly="GRCh37",
             tool_or_data_version="Ensembl VEP REST (grch37.rest.ensembl.org)",
             retrieved_at=stamp or now_iso(),
-            url=url,
+            url=ensembl_locus_url(chrom, pos),
             interpretation=(
                 f"VEP query failed for {gene}. Consequence remains unknown. "
                 "This gap is reported, not hidden."
@@ -271,6 +281,7 @@ def annotate_candidate(
     # --- empty annotation -----------------------------------------------------
     if not parsed.get("most_severe_consequence"):
         return [Evidence(
+            record_kind="gap",
             evidence_id="",
             candidate_id=cid,
             category="vep",
@@ -278,7 +289,7 @@ def annotate_candidate(
             query=f"{chrom}:{pos} {ref}>{alt}",
             assembly="GRCh37",
             tool_or_data_version=f"Ensembl VEP REST, retrieved {stamp}",
-            retrieved_at=stamp, url=url,
+            retrieved_at=stamp, url=ensembl_locus_url(chrom, pos),
             interpretation=(
                 f"VEP returned no consequence for {gene} at {chrom}:{pos}. "
                 "The variant may be intergenic or in an unrecognised region."
@@ -295,6 +306,11 @@ def annotate_candidate(
     # Side-effect: fill the gap in the candidate dict
     if not cand.get("consequence"):
         cand["consequence"] = consequence
+    # Downstream tools (ClinVar, PubMed, SpliceAI, AlphaMissense) key off the
+    # gene symbol. On the ad-hoc path the candidate is built from coordinates
+    # alone, so VEP is the first thing that knows the gene - hand it back.
+    if not cand.get("gene") and gene_vep:
+        cand["gene"] = gene_vep
 
     parts = [
         f"VEP annotates {gene} {chrom}:{pos} {ref}>{alt} as "
@@ -321,6 +337,7 @@ def annotate_candidate(
             "data — agreement is not independent replication.")
 
     rows: list[Evidence] = [Evidence(
+        record_kind="retrieved",
         evidence_id="",
         candidate_id=cid,
         category="vep",
@@ -332,7 +349,7 @@ def annotate_candidate(
         raw_value=f"{consequence} | {impact} | {transcript}",
         tool_or_data_version=(
             f"Ensembl VEP REST (grch37.rest.ensembl.org), retrieved {stamp}"),
-        url=url,
+        url=ensembl_locus_url(chrom, pos),
         retrieved_at=stamp,
         interpretation=" ".join(parts),
         limitations=[
@@ -345,6 +362,7 @@ def annotate_candidate(
     # --- gene symbol mismatch ------------------------------------------------
     if gene_vep and gene != "?" and gene_vep != gene:
         rows.append(Evidence(
+            record_kind="computed",
             evidence_id="",
             candidate_id=cid,
             category="vep",
@@ -354,7 +372,7 @@ def annotate_candidate(
             raw_field="gene_symbol",
             raw_value=f"Exomiser: {gene}, VEP: {gene_vep}",
             tool_or_data_version=f"Ensembl VEP REST, retrieved {stamp}",
-            url=url, retrieved_at=stamp,
+            url=ensembl_locus_url(chrom, pos), retrieved_at=stamp,
             interpretation=(
                 f"Gene symbol mismatch: Exomiser says {gene}, VEP says "
                 f"{gene_vep}. May reflect different transcript databases or "

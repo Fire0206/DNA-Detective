@@ -367,6 +367,25 @@ def var_type_of(ref: str, alt: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _disease_url(disease: Any) -> str:
+    """Public record URL for an Exomiser disease id, chosen by registry prefix."""
+    if not isinstance(disease, str):
+        return ""
+    ident = disease.split(":")[-1]
+    if disease.startswith("OMIM:"):
+        return f"https://omim.org/entry/{ident}"
+    if disease.startswith("ORPHA:"):
+        return f"https://www.orpha.net/en/disease/detail/{ident}"
+    return ""
+
+
+def _disease_source(disease: Any) -> str:
+    """Name the registry the annotation actually came from, not always OMIM."""
+    registry = ("Orphanet" if isinstance(disease, str)
+                and disease.startswith("ORPHA:") else "OMIM")
+    return f"{registry} disease annotation (via Exomiser 2406)"
+
+
 class EvidenceLog:
     """Append-only. Hands out sequential IDs so every claim is citable as E007."""
 
@@ -402,11 +421,18 @@ def harvest_evidence(
     # --- consequence / transcript ------------------------------------------
     eff = variant_effect(ve)
     if eff is not MISSING:
+        # The consequence is read out of the same clinVarData block the ClinVar
+        # row below cites, so it points at that same public record.
+        _cv = clinvar_block(ve)
+        _cv_id = _cv.get("variationId") or _cv.get("alleleId")
         attach(log.add(
+            record_kind="retrieved",
             candidate_id=cid,
             category="vep",
             source="ClinVar record (via Exomiser 2406 snapshot)",
             record_or_accession=str(accession or ""),
+            url=(f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{_cv_id}/"
+                 if _cv_id else ""),
             query=f"{cand.chrom}:{cand.pos} {cand.ref}>{cand.alt}",
             transcript=str(accession) if accession else None,
             raw_field="pathogenicityData.clinVarData.variantEffect",
@@ -443,6 +469,7 @@ def harvest_evidence(
             if isinstance(counts, dict) and counts else ""
         )
         attach(log.add(
+            record_kind="retrieved",
             candidate_id=cid,
             category="clinvar",
             source="ClinVar (via Exomiser 2406 snapshot)",
@@ -477,6 +504,7 @@ def harvest_evidence(
     state, af, raw = frequency_state(ve)
     if state == "absent":
         attach(log.add(
+            record_kind="computed",
             candidate_id=cid,
             category="gnomad",
             source="Exomiser frequency sources (gnomAD, ExAC, ESP, 1000G)",
@@ -494,11 +522,15 @@ def harvest_evidence(
                 "Absent is not the same as allele frequency 0.0; no AF is recorded.",
             ],
         ))
-        cand.missing_evidence.append("gnomAD v4 allele frequency not yet queried live")
+        # r2.1.1 is the GRCh37 release the live tool queries; v4 is GRCh38 and
+        # would need a liftover, so it stays a stated limitation either way.
+        cand.missing_evidence.append(
+            "gnomAD v4 (GRCh38) not queried - would require liftover")
     elif state == "present":
         cand.gnomad_af = af
         common = af is not None and af > COMMON_AF_PERCENT
         attach(log.add(
+            record_kind="computed",
             candidate_id=cid,
             category="gnomad",
             source="Exomiser frequency sources",
@@ -527,6 +559,7 @@ def harvest_evidence(
     cand.effect_scores.update(scores)
     for source, value in sorted(scores.items()):
         attach(log.add(
+            record_kind="computed",
             candidate_id=cid,
             category="effect",
             source=source,
@@ -556,6 +589,7 @@ def harvest_evidence(
             "is_exomiser_default": default_like,
         }
         attach(log.add(
+            record_kind="computed",
             candidate_id=cid,
             category="phenotype",
             source="Exomiser hiPHIVE / HPO",
@@ -598,16 +632,16 @@ def harvest_evidence(
             unmatched = [h for h in PATIENT_HPO if h not in set(disease_hpo)]
             disease_name = dig(acmg, "disease", "diseaseName")
             attach(log.add(
+                record_kind="retrieved",
                 candidate_id=cid,
                 category="phenotype",
-                source="OMIM disease annotation (via Exomiser 2406)",
+                source=_disease_source(disease),
                 record_or_accession=str(disease) if disease is not MISSING else "",
                 query="patient HPO: " + ", ".join(sorted(PATIENT_HPO)),
                 raw_field="disease.phenotypeIds",
                 raw_value=f"{len(disease_hpo)} terms; matched {len(matched)}/6",
                 tool_or_data_version=PROVENANCE,
-                url=(f"https://omim.org/entry/{str(disease).split(':')[-1]}"
-                     if isinstance(disease, str) and disease.startswith("OMIM:") else ""),
+                url=_disease_url(disease),
                 interpretation=(
                     f"{len(matched)}/6 patient HPO terms appear in the annotation for "
                     f"{disease} ({disease_name}): "
@@ -624,6 +658,7 @@ def harvest_evidence(
                 ],
             ), supporting=bool(matched))
         attach(log.add(
+            record_kind="computed",
             candidate_id=cid,
             category="clingen",
             source="Exomiser ACMG/AMP auto-assignment",
